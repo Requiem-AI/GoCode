@@ -3,10 +3,11 @@ package context
 import (
 	context2 "context"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/rs/zerolog/log"
 )
 
 // Context is a small service wrapper that handles the startup/shutdown of the service
@@ -67,11 +68,11 @@ func (ctx *Context) Run() error {
 	// Start a goroutine that will wait for a signal
 	go func() {
 		sig := <-sigChan
-		log.Printf("Received signal: %v. Shutting down...", sig)
+		log.Info().Str("signal", sig.String()).Msg("Received signal. Shutting down")
 
 		for i := len(ctx.startOrder) - 1; i >= 0; i-- {
 			svcId := ctx.startOrder[i]
-			log.Printf("Shutting down %s...", svcId)
+			log.Info().Str("service", svcId).Msg("Shutting down")
 			ctx.serviceMap[svcId].Shutdown()
 		}
 		cancel()
@@ -81,7 +82,7 @@ func (ctx *Context) Run() error {
 		svcId := ctx.startOrder[i]
 
 		if err := ctx.Configure(ctx.serviceMap[svcId]); err != nil {
-			log.Fatalf("Context Configure Error: %s - %s", svcId, err)
+			log.Fatal().Err(err).Str("service", svcId).Msg("Context Configure Error")
 			return err
 		}
 	}
@@ -90,7 +91,7 @@ func (ctx *Context) Run() error {
 		svcId := ctx.startOrder[i]
 
 		if err := ctx.Start(ctx.serviceMap[svcId]); err != nil {
-			log.Fatalf("Context Start Error: %s - %s", svcId, err)
+			log.Fatal().Err(err).Str("service", svcId).Msg("Context Start Error")
 			return err
 		}
 	}
@@ -100,7 +101,7 @@ func (ctx *Context) Run() error {
 
 // Configure the given service
 func (ctx *Context) Configure(svc Service) error {
-	log.Printf("Context Configure: %s", svc.Id())
+	log.Info().Str("service", svc.Id()).Msg("Context Configure")
 
 	if err := svc.Configure(ctx); err != nil {
 		return err
@@ -111,7 +112,7 @@ func (ctx *Context) Configure(svc Service) error {
 
 // Start the given service
 func (ctx *Context) Start(svc Service) error {
-	log.Printf("Context Start: %s", svc.Id())
+	log.Info().Str("service", svc.Id()).Msg("Context Start")
 
 	if err := svc.Start(); err != nil {
 		return err

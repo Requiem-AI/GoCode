@@ -9,17 +9,20 @@ import (
 	"github.com/rs/zerolog/log"
 	"os"
 	"strings"
+	"time"
 )
 
 func main() {
-	log.Info().Msg("Starting GoBot")
-
 	err := godotenv.Load()
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error loading .env file")
 	}
 
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+	log.Logger = log.Output(zerolog.ConsoleWriter{
+		Out:        os.Stdout,
+		TimeFormat: time.RFC3339,
+	})
+	zerolog.TimeFieldFormat = time.RFC3339
 	logLevel := strings.ToLower(os.Getenv("LOG_LEVEL"))
 	switch logLevel {
 	case "trace":
@@ -37,6 +40,8 @@ func main() {
 		zerolog.SetGlobalLevel(zerolog.InfoLevel)
 		break
 	}
+
+	log.Info().Msg("Starting GoBot")
 
 	skipLoadPool := flag.Bool("pool-skip", false, "Skip preloading the pools on start")
 	flag.Parse()

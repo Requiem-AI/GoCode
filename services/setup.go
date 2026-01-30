@@ -2,6 +2,7 @@ package services
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,7 +27,11 @@ func (svc *SetupService) Configure(ctx *context.Context) error {
 		return err
 	}
 
-	return svc.runTelegramSetup()
+	if err := svc.runTelegramSetup(); err != nil {
+		return err
+	}
+
+	return svc.runGithubSSHSetup()
 }
 
 func (svc *SetupService) runTelegramSetup() error {
@@ -37,9 +42,10 @@ func (svc *SetupService) runTelegramSetup() error {
 	}
 
 	if current.isComplete() {
-		if !confirm(reader, "Telegram setup detected. Reconfigure? (y/N): ") {
-			return nil
-		}
+		//if !confirm(reader, "Telegram setup detected. Reconfigure? (y/N): ") {
+		//	return nil
+		//}
+		return nil
 	}
 
 	fmt.Fprintln(os.Stdout, "GoCode Telegram setup")
@@ -73,6 +79,69 @@ func (svc *SetupService) runTelegramSetup() error {
 	}
 
 	fmt.Fprintln(os.Stdout, "Telegram setup saved to .env.")
+	return nil
+}
+
+func (svc *SetupService) runGithubSSHSetup() error {
+	reader := bufio.NewReader(os.Stdin)
+
+	gitSvc := svc.Service(GIT_SVC)
+	if gitSvc == nil {
+		return errors.New("git service not available")
+	}
+	git := gitSvc.(*GitService)
+
+	enabled := git.GitHubUseSSH()
+	keyPathEnv := strings.TrimSpace(os.Getenv("GITHUB_SSH_KEY_PATH"))
+	if enabled || keyPathEnv != "" {
+		return nil
+	}
+	keyPath, err := git.GitHubSSHKeyPath()
+	if err != nil {
+		return err
+	}
+
+	if !confirm(reader, "Enable GitHub SSH for private repos? (y/N): ") {
+		return nil
+	}
+	enabled = true
+
+	if err := git.EnsureSSHKey(keyPath); err != nil {
+		return err
+	}
+
+	if err := git.SetGitHubSSHConfig(keyPath, true); err != nil {
+		return err
+	}
+
+	fmt.Fprintln(os.Stdout, "")
+	fmt.Fprintln(os.Stdout, "GitHub SSH setup")
+	registered, msg, err := git.CheckGitHubSSH(keyPath)
+	if err != nil {
+		fmt.Fprintln(os.Stdout, "Unable to verify GitHub SSH key registration.")
+		if msg != "" {
+			fmt.Fprintln(os.Stdout, msg)
+		}
+		fmt.Fprintln(os.Stdout, err.Error())
+		fmt.Fprintln(os.Stdout, "")
+		return nil
+	}
+	if registered {
+		fmt.Fprintln(os.Stdout, "SSH key is registered with GitHub.")
+		if msg != "" {
+			fmt.Fprintln(os.Stdout, msg)
+		}
+	} else {
+		fmt.Fprintln(os.Stdout, "SSH key is not registered with GitHub yet.")
+		fmt.Fprintln(os.Stdout, "Add your public key from:")
+		fmt.Fprintln(os.Stdout, keyPath+".pub")
+		fmt.Fprintln(os.Stdout, "GitHub settings: https://github.com/settings/ssh/new")
+		if msg != "" {
+			fmt.Fprintln(os.Stdout, msg)
+		}
+	}
+	fmt.Fprintln(os.Stdout, "")
+
 	return nil
 }
 

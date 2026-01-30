@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -36,9 +39,6 @@ func (c *CodexClient) ID() string {
 }
 
 func (c *CodexClient) Send(ctx context.Context, req Request) (Response, error) {
-	if req.RepoPath == "" {
-		return Response{}, errors.New("missing repo path")
-	}
 	if req.Message == "" {
 		return Response{}, errors.New("missing prompt")
 	}
@@ -52,7 +52,12 @@ func (c *CodexClient) Send(ctx context.Context, req Request) (Response, error) {
 		_, _ = c.run(ctx, repoPath, "resume", "--last")
 	}
 
-	out, err := c.run(ctx, repoPath, "exec", req.Message)
+	args := []string{"exec", req.Message, "-s", "workspace-write"}
+	if req.RepoPath != "" {
+		args = append(args, "--cd", req.RepoPath)
+	}
+
+	out, err := c.run(ctx, repoPath, args...)
 	if err != nil {
 		return Response{Text: out}, err
 	}
@@ -77,12 +82,17 @@ func (c *CodexClient) Clear(ctx context.Context, repoPath string) error {
 
 func (c *CodexClient) run(ctx context.Context, repoPath string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, c.bin, args...)
-	cmd.Dir = repoPath
+	if repoPath != "" {
+		cmd.Dir = repoPath
+	}
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmdline := strings.TrimSpace(strings.Join(append([]string{cmd.Path}, args...), " "))
+	fmt.Fprintf(os.Stdout, "[codex] exec: %s\n", cmdline)
+
+	cmd.Stdout = io.MultiWriter(&stdout, os.Stdout)
+	cmd.Stderr = io.MultiWriter(&stderr, os.Stderr)
 
 	if err := cmd.Run(); err != nil {
 		out := stdout.String()
