@@ -54,7 +54,7 @@ func (svc *GitService) Configure(ctx *appctx.Context) error {
 		return err
 	}
 
-	if err := os.MkdirAll(absBase, 0o755); err != nil {
+	if err := os.MkdirAll(absBase, 0o775); err != nil {
 		return err
 	}
 
@@ -287,7 +287,7 @@ func (svc *GitService) CreateFeatureBranch(repo *GitRepo, feature string) (strin
 }
 
 func (svc *GitService) initRepo(repoPath string) error {
-	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+	if err := os.MkdirAll(repoPath, 0o775); err != nil {
 		return err
 	}
 
@@ -311,7 +311,7 @@ func (svc *GitService) cloneRepo(repoURL, repoPath, token string) error {
 		return errors.New("repo url is empty")
 	}
 
-	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+	if err := os.MkdirAll(repoPath, 0o775); err != nil {
 		return err
 	}
 
