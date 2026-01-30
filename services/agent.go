@@ -34,3 +34,7 @@ func (svc *AgentService) Run(repoPath string, msg string) (string, error) {
 	}
 	return resp.Text, nil
 }
+
+func (svc *AgentService) Clear(repoPath string) error {
+	return svc.agent.Clear(context2.TODO(), repoPath)
+}
