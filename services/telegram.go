@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -163,7 +164,7 @@ func (svc *TelegramService) onText(c tb.Context) error {
 
 func (svc *TelegramService) onStart(c tb.Context) error {
 	log.Info().Str("text", c.Text()).Msg("onStart")
-	return c.Send("Create a topic with /new <name> [repo-url]. Use /github ssh first for private repos.")
+	return c.Send("Create a topic with /new <name> [repo-url|repo-path]. Use /github ssh first for private repos.")
 }
 
 func (svc *TelegramService) onClear(c tb.Context) error {
@@ -182,7 +183,7 @@ func (svc *TelegramService) onClear(c tb.Context) error {
 
 	if err := svc.agent.Clear(repo.Path); err != nil {
 		log.Error().Err(err).Msg("failed to clear agent context")
-		return c.Send("Failed to clear the context.")
+		return c.Send("Failed to clear the context.", &tb.SendOptions{ThreadID: msg.ThreadID})
 	}
 
 	_, err = svc.Bot.Send(c.Chat(), "Context cleared.", &tb.SendOptions{ThreadID: msg.ThreadID})
@@ -234,9 +235,9 @@ func (svc *TelegramService) onTopic(c tb.Context) error {
 		return nil
 	}
 
-	name, repoURL := parseTopicArgs(msg.Payload)
+	name, repoURL, repoPath := svc.parseTopicArgs(msg.Payload)
 	if name == "" {
-		return c.Send("Usage: /new <name> [repo-url]")
+		return c.Send("Usage: /new <name> [repo-url|repo-path]")
 	}
 
 	topic, err := svc.Bot.CreateTopic(c.Chat(), &tb.Topic{
@@ -248,14 +249,14 @@ func (svc *TelegramService) onTopic(c tb.Context) error {
 	}
 
 	token := svc.git.GitHubToken()
-	_, err = svc.ensureRepoFrom(c.Chat(), topic.ThreadID, repoURL, token)
+	_, err = svc.ensureRepoFrom(c.Chat(), topic.ThreadID, repoURL, repoPath, token)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to create repo")
-		if repoURL != "" {
+		if repoURL != "" || repoPath != "" {
 			if delErr := svc.Bot.DeleteTopic(c.Chat(), topic); delErr != nil {
 				log.Error().Err(delErr).Msg("failed to delete topic after repo error")
 			}
-			return c.Send(fmt.Sprintf("Repo clone failed: %s", err.Error()))
+			return c.Send(fmt.Sprintf("Repo setup failed: %s", err.Error()))
 		}
 		return c.Send(fmt.Sprintf("Topic created, but repo creation failed: %s", err.Error()))
 	}
@@ -298,13 +299,17 @@ func (svc *TelegramService) ensureRepo(chat *tb.Chat, threadID int) (*GitRepo, e
 	return svc.git.EnsureTopicRepo(chat.ID, threadID)
 }
 
-func (svc *TelegramService) ensureRepoFrom(chat *tb.Chat, threadID int, repoURL, token string) (*GitRepo, error) {
+func (svc *TelegramService) ensureRepoFrom(chat *tb.Chat, threadID int, repoURL, repoPath, token string) (*GitRepo, error) {
 	if svc.git == nil {
 		return nil, errors.New("git service not available")
 	}
 
 	if chat == nil {
 		return nil, errors.New("missing chat")
+	}
+
+	if strings.TrimSpace(repoPath) != "" {
+		return svc.git.EnsureTopicRepoFromPath(chat.ID, threadID, repoPath)
 	}
 
 	if repoURL == "" {
@@ -333,21 +338,30 @@ func (svc *TelegramService) createFeatureBranch(repo *GitRepo, feature string) (
 	return svc.git.CreateFeatureBranch(repo, feature)
 }
 
-func parseTopicArgs(payload string) (string, string) {
+func (svc *TelegramService) parseTopicArgs(payload string) (string, string, string) {
 	fields := strings.Fields(payload)
 	if len(fields) == 0 {
-		return "", ""
+		return "", "", ""
 	}
 	if len(fields) == 1 {
-		if looksLikeRepoURL(fields[0]) {
-			return topicNameFromRepoURL(fields[0]), fields[0]
+		if svc.looksLikeRepoURL(fields[0]) {
+			return svc.topicNameFromRepoURL(fields[0]), fields[0], ""
 		}
-		return fields[0], ""
+		if svc.looksLikeRepoPath(fields[0]) {
+			return svc.topicNameFromRepoPath(fields[0]), "", fields[0]
+		}
+		return fields[0], "", ""
 	}
-	return fields[0], fields[1]
+	if svc.looksLikeRepoURL(fields[1]) {
+		return fields[0], fields[1], ""
+	}
+	if svc.looksLikeRepoPath(fields[1]) {
+		return fields[0], "", fields[1]
+	}
+	return fields[0], fields[1], ""
 }
 
-func looksLikeRepoURL(value string) bool {
+func (svc *TelegramService) looksLikeRepoURL(value string) bool {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return false
@@ -361,7 +375,21 @@ func looksLikeRepoURL(value string) bool {
 	return strings.Contains(value, "github.com/") || strings.Contains(value, "gitlab.com/") || strings.Contains(value, "bitbucket.org/")
 }
 
-func topicNameFromRepoURL(repoURL string) string {
+func (svc *TelegramService) looksLikeRepoPath(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	if strings.Contains(value, "://") || strings.HasPrefix(value, "git@") || strings.HasPrefix(value, "ssh://") {
+		return false
+	}
+	if strings.HasPrefix(value, "~") || strings.HasPrefix(value, ".") || strings.HasPrefix(value, "/") {
+		return true
+	}
+	return strings.Contains(value, string(filepath.Separator))
+}
+
+func (svc *TelegramService) topicNameFromRepoURL(repoURL string) string {
 	trimmed := strings.TrimSpace(repoURL)
 	trimmed = strings.TrimSuffix(trimmed, "/")
 	if strings.Contains(trimmed, "://") {
@@ -379,6 +407,24 @@ func topicNameFromRepoURL(repoURL string) string {
 		trimmed = segments[len(segments)-1]
 	}
 	return strings.TrimSuffix(trimmed, ".git")
+}
+
+func (svc *TelegramService) topicNameFromRepoPath(repoPath string) string {
+	trimmed := strings.TrimSpace(repoPath)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, "~") {
+		if home, err := os.UserHomeDir(); err == nil {
+			trimmed = filepath.Join(home, strings.TrimPrefix(trimmed, "~"))
+		}
+	}
+	trimmed = filepath.Clean(trimmed)
+	base := filepath.Base(trimmed)
+	if base == "." || base == string(filepath.Separator) {
+		return "repo"
+	}
+	return base
 }
 
 func (svc *TelegramService) onGithub(c tb.Context) error {

@@ -76,6 +76,66 @@ func (svc *GitService) EnsureTopicRepoFrom(chatID int64, threadID int, repoURL, 
 	return svc.ensureTopicRepo(chatID, threadID, repoURL, token)
 }
 
+func (svc *GitService) EnsureTopicRepoFromPath(chatID int64, threadID int, repoPath string) (*GitRepo, error) {
+	if threadID == 0 {
+		return nil, errors.New("missing topic thread id")
+	}
+
+	trimmed := strings.TrimSpace(repoPath)
+	if trimmed == "" {
+		return nil, errors.New("repo path is empty")
+	}
+
+	if strings.HasPrefix(trimmed, "~") {
+		if home, err := os.UserHomeDir(); err == nil {
+			trimmed = filepath.Join(home, strings.TrimPrefix(trimmed, "~"))
+		}
+	}
+
+	absPath, err := filepath.Abs(trimmed)
+	if err != nil {
+		return nil, err
+	}
+
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, errors.New("repo path is not a directory")
+	}
+	if !svc.isGitRepo(absPath) {
+		return nil, errors.New("repo path is not a git repository")
+	}
+
+	key := topicKey(chatID, threadID)
+	svc.mu.Lock()
+	repo := svc.repos[key]
+	svc.mu.Unlock()
+
+	if repo != nil {
+		return repo, nil
+	}
+
+	defaultBranch := svc.defaultBranch(absPath)
+	if defaultBranch == "" {
+		defaultBranch = "main"
+	}
+
+	repo = &GitRepo{
+		ChatID:        chatID,
+		ThreadID:      threadID,
+		Path:          absPath,
+		DefaultBranch: defaultBranch,
+	}
+
+	svc.mu.Lock()
+	svc.repos[key] = repo
+	svc.mu.Unlock()
+
+	return repo, nil
+}
+
 func (svc *GitService) GitHubToken() string {
 	return strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
 }
