@@ -107,7 +107,7 @@ func (svc *TelegramService) onText(c tb.Context) error {
 	}
 
 	if !msg.TopicMessage || msg.ThreadID == 0 {
-		log.Info().Str("text", msg.Text).Msg("onText main")
+		log.Info().Int64("chat_id", c.Chat().ID).Str("text", msg.Text).Msg("onText main")
 
 		_ = svc.Bot.React(c.Chat(), c.Message(), tb.ReactionOptions{Reactions: []tb.Reaction{tb.Reaction{
 			Type:  "emoji",
@@ -128,7 +128,7 @@ func (svc *TelegramService) onText(c tb.Context) error {
 		return err
 	}
 
-	log.Info().Str("text", msg.Text).Int("topic", msg.ThreadID).Msg("onText topic")
+	log.Info().Int64("chat_id", c.Chat().ID).Str("text", msg.Text).Int("topic", msg.ThreadID).Msg("onText topic")
 
 	repo, err := svc.ensureRepo(c.Chat(), msg.ThreadID)
 	if err != nil {
