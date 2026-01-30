@@ -1,6 +1,7 @@
 package services
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -22,8 +23,9 @@ type TelegramService struct {
 	git   *GitService
 	agent *AgentService
 
-	mu            sync.Mutex
-	topicContexts map[string]*TopicContext
+	mu                sync.Mutex
+	topicContexts     map[string]*TopicContext
+	topicContextsPath string
 
 	deleteTopicMarkup  *tb.ReplyMarkup
 	deleteTopicConfirm tb.Btn
@@ -32,6 +34,8 @@ type TelegramService struct {
 
 type TopicContext struct {
 	Messages []string
+	RepoURL  string
+	RepoPath string
 }
 
 const TELEGRAM_SVC = "telegram_svc"
@@ -50,6 +54,15 @@ func (svc *TelegramService) Configure(ctx *context.Context) (err error) {
 	}
 
 	svc.topicContexts = make(map[string]*TopicContext)
+	path := strings.TrimSpace(os.Getenv("TELEGRAM_TOPIC_CONTEXTS_PATH"))
+	if path == "" {
+		path = filepath.Join("data", "telegram_topics.json")
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	svc.topicContextsPath = absPath
 
 	return svc.DefaultService.Configure(ctx)
 }
@@ -57,6 +70,10 @@ func (svc *TelegramService) Configure(ctx *context.Context) (err error) {
 func (svc *TelegramService) Start() error {
 	svc.agent = svc.Service(Agent_SVC).(*AgentService)
 	svc.git = svc.Service(GIT_SVC).(*GitService)
+
+	if err := svc.loadTopicContexts(); err != nil {
+		log.Error().Err(err).Msg("failed to load topic contexts")
+	}
 
 	svc.setupHandlers()
 	svc.setupEvents()
@@ -220,6 +237,8 @@ func (svc *TelegramService) onDeleteTopicConfirm(c tb.Context) error {
 		return c.Send(fmt.Sprintf("Failed to delete topic: %s", err.Error()), &tb.SendOptions{ThreadID: msg.ThreadID})
 	}
 
+	svc.deleteTopicContext(c.Chat().ID, msg.ThreadID)
+
 	return nil
 }
 
@@ -261,6 +280,13 @@ func (svc *TelegramService) onTopic(c tb.Context) error {
 		return c.Send(fmt.Sprintf("Topic created, but repo creation failed: %s", err.Error()))
 	}
 
+	if repoURL != "" || repoPath != "" {
+		svc.setTopicContext(c.Chat().ID, topic.ThreadID, &TopicContext{
+			RepoURL:  repoURL,
+			RepoPath: repoPath,
+		})
+	}
+
 	_, err = svc.Bot.Send(c.Chat(),
 		"Topic ready. Type anything to start",
 		&tb.SendOptions{ThreadID: topic.ThreadID, ParseMode: tb.ModeMarkdown})
@@ -288,12 +314,22 @@ func (svc *TelegramService) onTopicCreated(c tb.Context) error {
 }
 
 func (svc *TelegramService) ensureRepo(chat *tb.Chat, threadID int) (*GitRepo, error) {
-	if svc.git == nil {
-		return nil, errors.New("git service not available")
-	}
-
 	if chat == nil {
 		return nil, errors.New("missing chat")
+	}
+
+	if ctx := svc.getTopicContext(chat.ID, threadID); ctx != nil {
+		if strings.TrimSpace(ctx.RepoPath) != "" || strings.TrimSpace(ctx.RepoURL) != "" {
+			token := ""
+			if svc.git != nil {
+				token = svc.git.GitHubToken()
+			}
+			return svc.ensureRepoFrom(chat, threadID, ctx.RepoURL, ctx.RepoPath, token)
+		}
+	}
+
+	if svc.git == nil {
+		return nil, errors.New("git service not available")
 	}
 
 	return svc.git.EnsureTopicRepo(chat.ID, threadID)
@@ -301,22 +337,147 @@ func (svc *TelegramService) ensureRepo(chat *tb.Chat, threadID int) (*GitRepo, e
 
 func (svc *TelegramService) ensureRepoFrom(chat *tb.Chat, threadID int, repoURL, repoPath, token string) (*GitRepo, error) {
 	if svc.git == nil {
+		log.Error().Msg("ensure repo from: git service not available")
 		return nil, errors.New("git service not available")
 	}
 
 	if chat == nil {
+		log.Error().Msg("ensure repo from: missing chat")
 		return nil, errors.New("missing chat")
 	}
 
+	logger := log.With().
+		Int64("chat", chat.ID).
+		Int("topic", threadID).
+		Str("repo_url", repoURL).
+		Str("repo_path", repoPath).
+		Bool("has_token", strings.TrimSpace(token) != "").
+		Logger()
+
 	if strings.TrimSpace(repoPath) != "" {
-		return svc.git.EnsureTopicRepoFromPath(chat.ID, threadID, repoPath)
+		logger.Info().Msg("ensure repo from path")
+		repo, err := svc.git.EnsureTopicRepoFromPath(chat.ID, threadID, repoPath)
+		if err != nil {
+			logger.Error().Err(err).Msg("failed to ensure repo from path")
+		}
+		return repo, err
 	}
 
 	if repoURL == "" {
-		return svc.git.EnsureTopicRepo(chat.ID, threadID)
+		logger.Info().Msg("ensure repo default")
+		repo, err := svc.git.EnsureTopicRepo(chat.ID, threadID)
+		if err != nil {
+			logger.Error().Err(err).Msg("failed to ensure default repo")
+		}
+		return repo, err
 	}
 
-	return svc.git.EnsureTopicRepoFrom(chat.ID, threadID, repoURL, token)
+	logger.Info().Msg("ensure repo from url")
+	repo, err := svc.git.EnsureTopicRepoFrom(chat.ID, threadID, repoURL, token)
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to ensure repo from url")
+	}
+	return repo, err
+}
+
+func (svc *TelegramService) getTopicContext(chatID int64, threadID int) *TopicContext {
+	key := topicKey(chatID, threadID)
+	svc.mu.Lock()
+	ctx := svc.topicContexts[key]
+	svc.mu.Unlock()
+	return ctx
+}
+
+func (svc *TelegramService) setTopicContext(chatID int64, threadID int, ctx *TopicContext) {
+	key := topicKey(chatID, threadID)
+	svc.mu.Lock()
+	svc.topicContexts[key] = ctx
+	svc.mu.Unlock()
+	if err := svc.saveTopicContexts(); err != nil {
+		log.Error().Err(err).Msg("failed to save topic contexts")
+	}
+}
+
+func (svc *TelegramService) deleteTopicContext(chatID int64, threadID int) {
+	key := topicKey(chatID, threadID)
+	svc.mu.Lock()
+	delete(svc.topicContexts, key)
+	svc.mu.Unlock()
+	if err := svc.saveTopicContexts(); err != nil {
+		log.Error().Err(err).Msg("failed to save topic contexts")
+	}
+}
+
+func (svc *TelegramService) loadTopicContexts() error {
+	if svc.topicContextsPath == "" {
+		return nil
+	}
+	data, err := os.ReadFile(svc.topicContextsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	var ctxs map[string]*TopicContext
+	if err := json.Unmarshal(data, &ctxs); err != nil {
+		return err
+	}
+	if ctxs == nil {
+		ctxs = make(map[string]*TopicContext)
+	}
+
+	svc.mu.Lock()
+	svc.topicContexts = ctxs
+	svc.mu.Unlock()
+
+	return nil
+}
+
+func (svc *TelegramService) saveTopicContexts() error {
+	if svc.topicContextsPath == "" {
+		return nil
+	}
+
+	snapshot := make(map[string]*TopicContext)
+	svc.mu.Lock()
+	for key, ctx := range svc.topicContexts {
+		if ctx == nil {
+			continue
+		}
+		copyCtx := *ctx
+		snapshot[key] = &copyCtx
+	}
+	svc.mu.Unlock()
+
+	data, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	dir := filepath.Dir(svc.topicContextsPath)
+	if err := os.MkdirAll(dir, 0o775); err != nil {
+		return err
+	}
+
+	tmpFile, err := os.CreateTemp(dir, "telegram_topics_*.json")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = os.Remove(tmpFile.Name())
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+
+	return os.Rename(tmpFile.Name(), svc.topicContextsPath)
 }
 
 func (svc *TelegramService) deleteTopicRepo(chat *tb.Chat, threadID int) error {
@@ -372,7 +533,7 @@ func (svc *TelegramService) looksLikeRepoURL(value string) bool {
 	if strings.HasSuffix(value, ".git") {
 		return true
 	}
-	return strings.Contains(value, "github.com/") || strings.Contains(value, "gitlab.com/") || strings.Contains(value, "bitbucket.org/")
+	return false
 }
 
 func (svc *TelegramService) looksLikeRepoPath(value string) bool {
