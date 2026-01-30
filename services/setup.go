@@ -1,0 +1,235 @@
+package services
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/requiem-ai/gocode/context"
+)
+
+type SetupService struct {
+	context.DefaultService
+}
+
+const SETUP_SVC = "setup_svc"
+
+func (svc SetupService) Id() string {
+	return SETUP_SVC
+}
+
+func (svc *SetupService) Configure(ctx *context.Context) error {
+	if err := svc.DefaultService.Configure(ctx); err != nil {
+		return err
+	}
+
+	return svc.runTelegramSetup()
+}
+
+func (svc *SetupService) runTelegramSetup() error {
+	reader := bufio.NewReader(os.Stdin)
+
+	current := telegramConfig{
+		TelegramSecret: strings.TrimSpace(os.Getenv("TELEGRAM_SECRET")),
+	}
+
+	if current.isComplete() {
+		if !confirm(reader, "Telegram setup detected. Reconfigure? (y/N): ") {
+			return nil
+		}
+	}
+
+	fmt.Fprintln(os.Stdout, "GoCode Telegram setup")
+	fmt.Fprintln(os.Stdout, "Press Enter to keep the current value shown in brackets.")
+	fmt.Fprintln(os.Stdout, "")
+	fmt.Fprintln(os.Stdout, "BotFather tips:")
+	fmt.Fprintln(os.Stdout, "- Create a bot with /newbot, then copy the token.")
+	fmt.Fprintln(os.Stdout, "- No webhook needed; this service uses long polling.")
+	fmt.Fprintln(os.Stdout, "")
+
+	secret, err := promptRequired(reader, "Bot token (from BotFather /newbot)", current.TelegramSecret)
+	if err != nil {
+		return err
+	}
+
+	next := telegramConfig{
+		TelegramSecret: secret,
+	}
+
+	_ = os.Setenv("TELEGRAM_SECRET", next.TelegramSecret)
+
+	envPath, err := envFilePath()
+	if err != nil {
+		return err
+	}
+
+	if err := updateEnvFile(envPath, map[string]string{
+		"TELEGRAM_SECRET": next.TelegramSecret,
+	}); err != nil {
+		return err
+	}
+
+	fmt.Fprintln(os.Stdout, "Telegram setup saved to .env.")
+	return nil
+}
+
+type telegramConfig struct {
+	TelegramSecret string
+}
+
+func (cfg telegramConfig) isComplete() bool {
+	return cfg.TelegramSecret != ""
+}
+
+func confirm(reader *bufio.Reader, prompt string) bool {
+	fmt.Fprint(os.Stdout, prompt)
+	text, _ := reader.ReadString('\n')
+	text = strings.TrimSpace(strings.ToLower(text))
+	return text == "y" || text == "yes"
+}
+
+func promptRequired(reader *bufio.Reader, label, current string) (string, error) {
+	for {
+		value, err := promptWithDefault(reader, label, current, "")
+		if err != nil {
+			return "", err
+		}
+		if strings.TrimSpace(value) == "" {
+			fmt.Fprintln(os.Stdout, "Value required.")
+			continue
+		}
+		return value, nil
+	}
+}
+
+func promptWithDefault(reader *bufio.Reader, label, current, fallback string) (string, error) {
+	display := current
+	if display == "" {
+		display = fallback
+	}
+
+	if display != "" {
+		fmt.Fprintf(os.Stdout, "%s [%s]: ", label, display)
+	} else {
+		fmt.Fprintf(os.Stdout, "%s: ", label)
+	}
+
+	text, err := reader.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+
+	text = strings.TrimSpace(text)
+	if text == "" {
+		if current != "" {
+			return current, nil
+		}
+		return fallback, nil
+	}
+
+	return text, nil
+}
+
+func envFilePath() (string, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(wd, ".env"), nil
+}
+
+func updateEnvFile(path string, updates map[string]string) error {
+	existing, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	lines := []string{}
+	seen := make(map[string]bool, len(updates))
+
+	scanner := bufio.NewScanner(strings.NewReader(string(existing)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			lines = append(lines, line)
+			continue
+		}
+
+		prefix, key := parseEnvKey(trimmed)
+		if key == "" {
+			lines = append(lines, line)
+			continue
+		}
+
+		if value, ok := updates[key]; ok {
+			lines = append(lines, fmt.Sprintf("%s%s=%s", prefix, key, formatEnvValue(value)))
+			seen[key] = true
+			continue
+		}
+
+		lines = append(lines, line)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	keys := make([]string, 0, len(updates))
+	for key := range updates {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if seen[key] {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%s=%s", key, formatEnvValue(updates[key])))
+	}
+
+	output := strings.Join(lines, "\n")
+	if output != "" && !strings.HasSuffix(output, "\n") {
+		output += "\n"
+	}
+
+	return os.WriteFile(path, []byte(output), 0o600)
+}
+
+func parseEnvKey(line string) (string, string) {
+	trimmed := strings.TrimSpace(line)
+	prefix := ""
+	if strings.HasPrefix(trimmed, "export ") {
+		prefix = "export "
+		trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "export "))
+	}
+
+	idx := strings.Index(trimmed, "=")
+	if idx <= 0 {
+		return "", ""
+	}
+
+	key := strings.TrimSpace(trimmed[:idx])
+	if key == "" {
+		return "", ""
+	}
+
+	return prefix, key
+}
+
+func formatEnvValue(value string) string {
+	if value == "" {
+		return "\"\""
+	}
+
+	if !strings.ContainsAny(value, " \t#\"\\") {
+		return value
+	}
+
+	escaped := strings.ReplaceAll(value, "\\", "\\\\")
+	escaped = strings.ReplaceAll(escaped, "\"", "\\\"")
+	return fmt.Sprintf("\"%s\"", escaped)
+}
