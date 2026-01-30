@@ -185,7 +185,7 @@ func (svc *TelegramService) onClear(c tb.Context) error {
 		return c.Send("Failed to clear the context.")
 	}
 
-	_, err := svc.Bot.Send(c.Chat(), "Context cleared.", &tb.SendOptions{ThreadID: msg.ThreadID})
+	_, err = svc.Bot.Send(c.Chat(), "Context cleared.", &tb.SendOptions{ThreadID: msg.ThreadID})
 	return err
 }
 
