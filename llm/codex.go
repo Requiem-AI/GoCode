@@ -48,7 +48,8 @@ func (c *CodexClient) Send(ctx context.Context, req Request) (Response, error) {
 		return Response{}, err
 	}
 
-	if c.shouldResume(repoPath) {
+	shouldResume := c.shouldResume(repoPath)
+	if shouldResume {
 		_, _ = c.run(ctx, repoPath, "resume", "--last")
 	}
 
@@ -63,6 +64,13 @@ func (c *CodexClient) Send(ctx context.Context, req Request) (Response, error) {
 	out, err := c.run(ctx, repoPath, args...)
 	if err != nil {
 		return Response{Text: out}, err
+	}
+
+	if !shouldResume {
+		if out != "" {
+			out += "\n\n"
+		}
+		out += "New session started."
 	}
 
 	c.markSession(repoPath)

@@ -174,7 +174,17 @@ func (svc *TelegramService) onClear(c tb.Context) error {
 
 	log.Info().Int("topic", msg.ThreadID).Msg("onClear")
 
-	//svc.clearContext(msg.Chat.ID, msg.ThreadID)
+	repo, err := svc.ensureRepo(c.Chat(), msg.ThreadID)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to ensure repo for clear")
+		return c.Send("Couldn't prepare the repo for this topic.")
+	}
+
+	if err := svc.agent.Clear(repo.Path); err != nil {
+		log.Error().Err(err).Msg("failed to clear agent context")
+		return c.Send("Failed to clear the context.")
+	}
+
 	_, err := svc.Bot.Send(c.Chat(), "Context cleared.", &tb.SendOptions{ThreadID: msg.ThreadID})
 	return err
 }
