@@ -2,12 +2,15 @@ package services
 
 import (
 	"bufio"
+	ctx "context"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/requiem-ai/gocode/context"
 )
@@ -27,11 +30,63 @@ func (svc *SetupService) Configure(ctx *context.Context) error {
 		return err
 	}
 
+	if err := svc.runCodexLoginSetup(); err != nil {
+		return err
+	}
+
 	if err := svc.runTelegramSetup(); err != nil {
 		return err
 	}
 
 	return svc.runGithubSSHSetup()
+}
+
+func (svc *SetupService) runCodexLoginSetup() error {
+	reader := bufio.NewReader(os.Stdin)
+
+	bin := strings.TrimSpace(os.Getenv("CODEX_BIN"))
+	if bin == "" {
+		bin = "codex"
+	}
+
+	if _, err := exec.LookPath(bin); err != nil {
+		return fmt.Errorf("codex CLI not found (%s): %w", bin, err)
+	}
+
+	statusCtx, cancel := ctx.WithTimeout(ctx.Background(), 5*time.Second)
+	defer cancel()
+
+	statusCmd := exec.CommandContext(statusCtx, bin, "login", "status")
+	out, err := statusCmd.CombinedOutput()
+	msg := strings.TrimSpace(string(out))
+	lowerMsg := strings.ToLower(msg)
+
+	if strings.Contains(lowerMsg, "not logged in") || strings.Contains(lowerMsg, "logged out") {
+		// fallthrough to login flow
+	} else if strings.Contains(lowerMsg, "logged in") {
+		return nil
+	}
+	if err != nil && msg == "" {
+		return fmt.Errorf("failed to check Codex login status: %w", err)
+	}
+
+	fmt.Fprintln(os.Stdout, "Codex login required.")
+	if msg != "" {
+		fmt.Fprintln(os.Stdout, msg)
+	}
+
+	if !confirm(reader, "Start Codex login now? (y/N): ") {
+		return nil
+	}
+
+	loginCtx, loginCancel := ctx.WithTimeout(ctx.Background(), 5*time.Minute)
+	defer loginCancel()
+
+	loginCmd := exec.CommandContext(loginCtx, bin, "login")
+	loginCmd.Stdin = os.Stdin
+	loginCmd.Stdout = os.Stdout
+	loginCmd.Stderr = os.Stderr
+	return loginCmd.Run()
 }
 
 func (svc *SetupService) runTelegramSetup() error {

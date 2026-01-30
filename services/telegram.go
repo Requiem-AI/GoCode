@@ -186,7 +186,7 @@ func (svc *TelegramService) onClear(c tb.Context) error {
 		return c.Send("Failed to clear the context.", &tb.SendOptions{ThreadID: msg.ThreadID})
 	}
 
-	_, err := svc.Bot.Send(c.Chat(), "Context cleared.", &tb.SendOptions{ThreadID: msg.ThreadID})
+	_, err = svc.Bot.Send(c.Chat(), "Context cleared.", &tb.SendOptions{ThreadID: msg.ThreadID})
 	return err
 }
 
@@ -249,7 +249,7 @@ func (svc *TelegramService) onTopic(c tb.Context) error {
 	}
 
 	token := svc.git.GitHubToken()
-	repo, err := svc.ensureRepoFrom(c.Chat(), topic.ThreadID, repoURL, repoPath, token)
+	_, err = svc.ensureRepoFrom(c.Chat(), topic.ThreadID, repoURL, repoPath, token)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to create repo")
 		if repoURL != "" || repoPath != "" {
@@ -262,7 +262,7 @@ func (svc *TelegramService) onTopic(c tb.Context) error {
 	}
 
 	_, err = svc.Bot.Send(c.Chat(),
-		fmt.Sprintf("Topic ready. Repo: `%s`", repo.Path),
+		"Topic ready. Type anything to start",
 		&tb.SendOptions{ThreadID: topic.ThreadID, ParseMode: tb.ModeMarkdown})
 	return err
 }
@@ -273,16 +273,18 @@ func (svc *TelegramService) onTopicCreated(c tb.Context) error {
 		return nil
 	}
 
-	repo, err := svc.ensureRepo(c.Chat(), topic.ThreadID)
-	if err != nil {
-		log.Error().Err(err).Msg("failed to create repo for topic")
-		return nil
-	}
+	log.Info().Str("name", topic.Name).Msg("Topic created")
+	//repo, err := svc.ensureRepo(c.Chat(), topic.ThreadID)
+	//if err != nil {
+	//	log.Error().Err(err).Msg("failed to create repo for topic")
+	//	return nil
+	//}
 
-	_, err = svc.Bot.Send(c.Chat(),
-		fmt.Sprintf("Repo initialized for this topic: `%s`", repo.Path),
-		&tb.SendOptions{ThreadID: topic.ThreadID, ParseMode: tb.ModeMarkdown})
-	return err
+	//_, err := svc.Bot.Send(c.Chat(),
+	//	fmt.Sprintf("Repo initialized for this topic: `%s`", repo.Path),
+	//	&tb.SendOptions{ThreadID: topic.ThreadID, ParseMode: tb.ModeMarkdown})
+	//return err
+	return nil
 }
 
 func (svc *TelegramService) ensureRepo(chat *tb.Chat, threadID int) (*GitRepo, error) {

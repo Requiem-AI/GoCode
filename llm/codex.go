@@ -53,9 +53,12 @@ func (c *CodexClient) Send(ctx context.Context, req Request) (Response, error) {
 		_, _ = c.run(ctx, repoPath, "resume", "--last")
 	}
 
-	args := []string{"exec", req.Message, "-s", "workspace-write"}
+	args := []string{"exec", "-s", "danger-full-access", req.Message}
 	if req.RepoPath != "" {
 		args = append(args, "--cd", req.RepoPath)
+	}
+	if c.shouldResume(repoPath) {
+		args = append(args, "resume", "--last")
 	}
 
 	out, err := c.run(ctx, repoPath, args...)
