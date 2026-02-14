@@ -55,6 +55,7 @@ func main() {
 		&services.SetupService{},
 		&services.GitService{},
 		&services.AgentService{},
+		&services.PreviewService{},
 		&services.TelegramService{},
 	)
 

@@ -4,11 +4,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/requiem-ai/gocode/context"
 	"github.com/rs/zerolog/log"
@@ -20,12 +23,14 @@ type TelegramService struct {
 
 	Bot *tb.Bot
 
-	git   *GitService
-	agent *AgentService
+	git     *GitService
+	agent   *AgentService
+	preview *PreviewService
 
 	mu                sync.Mutex
 	topicContexts     map[string]*TopicContext
 	topicContextsPath string
+	allowedUserID     int64
 
 	deleteTopicMarkup  *tb.ReplyMarkup
 	deleteTopicConfirm tb.Btn
@@ -45,9 +50,21 @@ func (svc TelegramService) Id() string {
 }
 
 func (svc *TelegramService) Configure(ctx *context.Context) (err error) {
+	allowedUserID, err := svc.parseAllowedUserID()
+	if err != nil {
+		return err
+	}
+	svc.allowedUserID = allowedUserID
+
 	svc.Bot, err = tb.NewBot(tb.Settings{
-		Token:  os.Getenv("TELEGRAM_SECRET"),
-		Poller: &tb.LongPoller{},
+		Token: os.Getenv("TELEGRAM_SECRET"),
+		Poller: &tb.LongPoller{
+			Timeout: 3 * time.Second,
+		},
+		Client: &http.Client{Timeout: 10 * time.Second},
+		OnError: func(err error, c tb.Context) {
+			log.Error().Err(err).Msg("Telegram bot error")
+		},
 	})
 	if err != nil {
 		return err
@@ -70,6 +87,7 @@ func (svc *TelegramService) Configure(ctx *context.Context) (err error) {
 func (svc *TelegramService) Start() error {
 	svc.agent = svc.Service(Agent_SVC).(*AgentService)
 	svc.git = svc.Service(GIT_SVC).(*GitService)
+	svc.preview = svc.Service(PREVIEW_SVC).(*PreviewService)
 
 	if err := svc.loadTopicContexts(); err != nil {
 		log.Error().Err(err).Msg("failed to load topic contexts")
@@ -91,13 +109,13 @@ func (svc *TelegramService) Shutdown() {
 }
 
 func (svc *TelegramService) setupHandlers() {
-	svc.Bot.Handle("/start", svc.onStart)
-	svc.Bot.Handle("/clear", svc.onClear)
-	svc.Bot.Handle("/new", svc.onTopic)
-	svc.Bot.Handle("/delete", svc.onDeleteTopic)
-	svc.Bot.Handle("/github", svc.onGithub)
+	svc.Bot.Handle("/clear", svc.guardHandler(svc.onClear))
+	svc.Bot.Handle("/new", svc.guardHandler(svc.onTopic))
+	svc.Bot.Handle("/delete", svc.guardHandler(svc.onDeleteTopic))
+	svc.Bot.Handle("/github", svc.guardHandler(svc.onGithub))
+	svc.Bot.Handle("/preview", svc.guardHandler(svc.onPreview))
 
-	svc.Bot.Handle(tb.OnText, svc.onText)
+	svc.Bot.Handle(tb.OnText, svc.guardHandler(svc.onText))
 
 	svc.deleteTopicMarkup = &tb.ReplyMarkup{}
 	svc.deleteTopicConfirm = svc.deleteTopicMarkup.Data("Delete", "topic_delete_confirm")
@@ -106,12 +124,58 @@ func (svc *TelegramService) setupHandlers() {
 		svc.deleteTopicMarkup.Row(svc.deleteTopicConfirm, svc.deleteTopicCancel),
 	)
 
-	svc.Bot.Handle(&svc.deleteTopicConfirm, svc.onDeleteTopicConfirm)
-	svc.Bot.Handle(&svc.deleteTopicCancel, svc.onDeleteTopicCancel)
+	svc.Bot.Handle(&svc.deleteTopicConfirm, svc.guardHandler(svc.onDeleteTopicConfirm))
+	svc.Bot.Handle(&svc.deleteTopicCancel, svc.guardHandler(svc.onDeleteTopicCancel))
 }
 
 func (svc *TelegramService) setupEvents() {
-	svc.Bot.Handle(tb.OnTopicCreated, svc.onTopicCreated)
+	svc.Bot.Handle(tb.OnTopicCreated, svc.guardHandler(svc.onTopicCreated))
+}
+
+func (svc *TelegramService) guardHandler(fn tb.HandlerFunc) tb.HandlerFunc {
+	return func(c tb.Context) error {
+		if !svc.isAllowedUser(c) {
+			return nil
+		}
+		return fn(c)
+	}
+}
+
+func (svc *TelegramService) isAllowedUser(c tb.Context) bool {
+	if svc.allowedUserID == 0 {
+		return true
+	}
+	if c == nil {
+		return false
+	}
+	sender := c.Sender()
+	if sender == nil {
+		return false
+	}
+	if sender.ID == svc.Bot.Me.ID {
+		return false // Ignore bot msgs
+	}
+	if sender.ID != svc.allowedUserID {
+		log.Warn().
+			Int64("allowed_user_id", svc.allowedUserID).
+			Int64("sender_id", sender.ID).
+			Str("sender_username", sender.Username).
+			Msg("telegram message ignored: sender not allowed")
+		return false
+	}
+	return true
+}
+
+func (svc *TelegramService) parseAllowedUserID() (int64, error) {
+	raw := strings.TrimSpace(os.Getenv("USER_ID"))
+	if raw == "" {
+		return 0, nil
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid USER_ID %q: %w", raw, err)
+	}
+	return value, nil
 }
 
 func (svc *TelegramService) onText(c tb.Context) error {
@@ -177,11 +241,6 @@ func (svc *TelegramService) onText(c tb.Context) error {
 		resp,
 		&tb.SendOptions{ThreadID: msg.ThreadID, ParseMode: tb.ModeMarkdown})
 	return err
-}
-
-func (svc *TelegramService) onStart(c tb.Context) error {
-	log.Info().Str("text", c.Text()).Msg("onStart")
-	return c.Send("Create a topic with /new <name> [repo-url|repo-path]. Use /github ssh first for private repos.")
 }
 
 func (svc *TelegramService) onClear(c tb.Context) error {
@@ -257,6 +316,11 @@ func (svc *TelegramService) onTopic(c tb.Context) error {
 	name, repoURL, repoPath := svc.parseTopicArgs(msg.Payload)
 	if name == "" {
 		return c.Send("Usage: /new <name> [repo-url|repo-path]")
+	}
+	if repoURL != "" || repoPath != "" {
+		if existingThreadID, ok := svc.findTopicForRepo(repoURL, repoPath); ok {
+			return c.Send(fmt.Sprintf("Repo already linked to topic %d. Use that topic or delete it before creating another.", existingThreadID))
+		}
 	}
 
 	topic, err := svc.Bot.CreateTopic(c.Chat(), &tb.Topic{
@@ -550,6 +614,104 @@ func (svc *TelegramService) looksLikeRepoPath(value string) bool {
 	return strings.Contains(value, string(filepath.Separator))
 }
 
+func (svc *TelegramService) findTopicForRepo(repoURL, repoPath string) (int, bool) {
+	urlKey := normalizeRepoURL(repoURL)
+	pathKey := normalizeRepoPath(repoPath)
+	if urlKey == "" && pathKey == "" {
+		return 0, false
+	}
+
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+
+	for key, ctx := range svc.topicContexts {
+		if ctx == nil {
+			continue
+		}
+		if urlKey != "" && normalizeRepoURL(ctx.RepoURL) == urlKey {
+			if _, threadID, ok := parseTopicKey(key); ok {
+				return threadID, true
+			}
+		}
+		if pathKey != "" && normalizeRepoPath(ctx.RepoPath) == pathKey {
+			if _, threadID, ok := parseTopicKey(key); ok {
+				return threadID, true
+			}
+		}
+	}
+
+	return 0, false
+}
+
+func normalizeRepoURL(repoURL string) string {
+	trimmed := strings.TrimSpace(repoURL)
+	if trimmed == "" {
+		return ""
+	}
+	trimmed = strings.TrimSuffix(trimmed, "/")
+	trimmed = strings.TrimSuffix(trimmed, ".git")
+
+	if strings.HasPrefix(trimmed, "git@") {
+		parts := strings.SplitN(trimmed, ":", 2)
+		if len(parts) == 2 {
+			host := strings.TrimPrefix(parts[0], "git@")
+			path := strings.TrimPrefix(parts[1], "/")
+			return strings.ToLower(host + "/" + strings.TrimSuffix(path, ".git"))
+		}
+	}
+
+	if strings.HasPrefix(trimmed, "ssh://") {
+		parsed, err := url.Parse(trimmed)
+		if err == nil && parsed.Host != "" {
+			path := strings.TrimPrefix(parsed.Path, "/")
+			return strings.ToLower(parsed.Host + "/" + strings.TrimSuffix(path, ".git"))
+		}
+	}
+
+	if strings.Contains(trimmed, "://") {
+		parsed, err := url.Parse(trimmed)
+		if err == nil && parsed.Host != "" {
+			path := strings.TrimPrefix(parsed.Path, "/")
+			return strings.ToLower(parsed.Host + "/" + strings.TrimSuffix(path, ".git"))
+		}
+	}
+
+	return strings.ToLower(trimmed)
+}
+
+func normalizeRepoPath(repoPath string) string {
+	trimmed := strings.TrimSpace(repoPath)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, "~") {
+		if home, err := os.UserHomeDir(); err == nil {
+			trimmed = filepath.Join(home, strings.TrimPrefix(trimmed, "~"))
+		}
+	}
+	absPath, err := filepath.Abs(trimmed)
+	if err != nil {
+		return filepath.Clean(trimmed)
+	}
+	return filepath.Clean(absPath)
+}
+
+func parseTopicKey(key string) (int64, int, bool) {
+	parts := strings.SplitN(key, ":", 2)
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	chatID, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	threadID, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, false
+	}
+	return chatID, threadID, true
+}
+
 func (svc *TelegramService) topicNameFromRepoURL(repoURL string) string {
 	trimmed := strings.TrimSpace(repoURL)
 	trimmed = strings.TrimSuffix(trimmed, "/")
@@ -625,6 +787,66 @@ func (svc *TelegramService) onGithub(c tb.Context) error {
 		return c.Send("Failed to save GitHub token.")
 	}
 	return c.Send("GitHub token saved.")
+}
+
+func (svc *TelegramService) onPreview(c tb.Context) error {
+	msg := c.Message()
+	if msg == nil {
+		return nil
+	}
+	if !msg.TopicMessage || msg.ThreadID == 0 {
+		return c.Send("Use /preview inside a topic.")
+	}
+	if svc.preview == nil {
+		return c.Send("Preview service not available.")
+	}
+
+	payload := strings.TrimSpace(msg.Payload)
+	fields := strings.Fields(payload)
+	action := "start"
+	tunnel := ""
+
+	if len(fields) > 0 {
+		switch strings.ToLower(fields[0]) {
+		case "start", "status", "stop":
+			action = strings.ToLower(fields[0])
+			if len(fields) > 1 {
+				tunnel = strings.ToLower(fields[1])
+			}
+		case "ngrok", "tailscale":
+			tunnel = strings.ToLower(fields[0])
+		default:
+			return c.Send("Usage: /preview [start|status|stop] [ngrok|tailscale]")
+		}
+	}
+
+	switch action {
+	case "status":
+		if session, ok := svc.preview.PreviewStatus(c.Chat().ID, msg.ThreadID); ok {
+			return c.Send(fmt.Sprintf("Preview running:\nURL: %s\nTunnel: %s\nPort: %d", session.URL, session.Tunnel, session.Port),
+				&tb.SendOptions{ThreadID: msg.ThreadID})
+		}
+		return c.Send("No preview running for this topic.", &tb.SendOptions{ThreadID: msg.ThreadID})
+	case "stop":
+		if err := svc.preview.StopPreview(c.Chat().ID, msg.ThreadID); err != nil {
+			log.Error().Err(err).Msg("failed to stop preview")
+			return c.Send("Failed to stop preview.", &tb.SendOptions{ThreadID: msg.ThreadID})
+		}
+		return c.Send("Preview stopped.", &tb.SendOptions{ThreadID: msg.ThreadID})
+	default:
+		repo, err := svc.ensureRepo(c.Chat(), msg.ThreadID)
+		if err != nil {
+			log.Error().Err(err).Msg("failed to ensure repo for preview")
+			return c.Send("Couldn't prepare the repo for preview.", &tb.SendOptions{ThreadID: msg.ThreadID})
+		}
+		session, err := svc.preview.StartPreview(c.Chat().ID, msg.ThreadID, repo.Path, tunnel)
+		if err != nil {
+			log.Error().Err(err).Msg("failed to start preview")
+			return c.Send(fmt.Sprintf("Failed to start preview: %s", err.Error()), &tb.SendOptions{ThreadID: msg.ThreadID})
+		}
+		msgText := fmt.Sprintf("Preview ready:\nURL: %s\nTunnel: %s\nPort: %d", session.URL, session.Tunnel, session.Port)
+		return c.Send(msgText, &tb.SendOptions{ThreadID: msg.ThreadID})
+	}
 }
 
 func (svc *TelegramService) startGithubSSH(c tb.Context) error {

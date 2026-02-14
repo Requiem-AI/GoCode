@@ -3,16 +3,20 @@ package services
 import (
 	"bufio"
 	ctx "context"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/requiem-ai/gocode/context"
+	tb "gopkg.in/telebot.v3"
 )
 
 type SetupService struct {
@@ -97,10 +101,10 @@ func (svc *SetupService) runTelegramSetup() error {
 	}
 
 	if current.isComplete() {
-		//if !confirm(reader, "Telegram setup detected. Reconfigure? (y/N): ") {
-		//	return nil
-		//}
-		return nil
+		if err := svc.registerTelegramBotCommands(current.TelegramSecret); err != nil {
+			return err
+		}
+		return svc.runTelegramUserIDSetup(current.TelegramSecret)
 	}
 
 	fmt.Fprintln(os.Stdout, "GoCode Telegram setup")
@@ -134,7 +138,10 @@ func (svc *SetupService) runTelegramSetup() error {
 	}
 
 	fmt.Fprintln(os.Stdout, "Telegram setup saved to .env.")
-	return nil
+	if err := svc.registerTelegramBotCommands(next.TelegramSecret); err != nil {
+		return err
+	}
+	return svc.runTelegramUserIDSetup(next.TelegramSecret)
 }
 
 func (svc *SetupService) runGithubSSHSetup() error {
@@ -206,6 +213,130 @@ type telegramConfig struct {
 
 func (cfg telegramConfig) isComplete() bool {
 	return cfg.TelegramSecret != ""
+}
+
+func (svc *SetupService) runTelegramUserIDSetup(secret string) error {
+	if strings.TrimSpace(os.Getenv("USER_ID")) != "" {
+		return nil
+	}
+	if strings.TrimSpace(secret) == "" {
+		return errors.New("telegram bot token is required before USER_ID setup")
+	}
+
+	code, err := svc.generateTelegramVerificationCode()
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintln(os.Stdout, "")
+	fmt.Fprintln(os.Stdout, "Telegram user verification")
+	fmt.Fprintln(os.Stdout, "Send this code to the bot in Telegram to authorize your user:")
+	fmt.Fprintln(os.Stdout, code)
+	fmt.Fprintln(os.Stdout, "")
+
+	userID, err := svc.waitForTelegramVerification(secret, code, 5*time.Minute)
+	if err != nil {
+		return err
+	}
+
+	_ = os.Setenv("USER_ID", strconv.FormatInt(userID, 10))
+
+	envPath, err := envFilePath()
+	if err != nil {
+		return err
+	}
+
+	if err := updateEnvFile(envPath, map[string]string{
+		"USER_ID": strconv.FormatInt(userID, 10),
+	}); err != nil {
+		return err
+	}
+
+	fmt.Fprintln(os.Stdout, "USER_ID saved to .env.")
+	return nil
+}
+
+func (svc *SetupService) registerTelegramBotCommands(secret string) error {
+	if strings.TrimSpace(secret) == "" {
+		return errors.New("telegram bot token is required to register commands")
+	}
+
+	bot, err := tb.NewBot(tb.Settings{
+		Token:  secret,
+		Poller: &tb.LongPoller{Timeout: 1 * time.Second},
+	})
+	if err != nil {
+		return err
+	}
+
+	commands := []tb.Command{
+		{Text: "start", Description: "Show quick start instructions"},
+		{Text: "new", Description: "Create a topic: /new <name> [repo]"},
+		{Text: "clear", Description: "Clear the current topic context"},
+		{Text: "delete", Description: "Delete the current topic and repo"},
+		{Text: "github", Description: "Configure GitHub auth (/github ssh|status|logout)"},
+		{Text: "preview", Description: "Start/stop web preview (/preview [start|status|stop])"},
+	}
+
+	if err := bot.SetCommands(commands, tb.CommandScope{Type: tb.CommandScopeDefault}); err != nil {
+		return err
+	}
+
+	fmt.Fprintln(os.Stdout, "Telegram commands and menu updated.")
+	return nil
+}
+
+func (svc *SetupService) generateTelegramVerificationCode() (string, error) {
+	const codeDigits = 6
+	const maxDigit = 10
+
+	var sb strings.Builder
+	sb.Grow(codeDigits)
+	for i := 0; i < codeDigits; i++ {
+		n, err := rand.Int(rand.Reader, big.NewInt(maxDigit))
+		if err != nil {
+			return "", err
+		}
+		sb.WriteString(strconv.Itoa(int(n.Int64())))
+	}
+	return sb.String(), nil
+}
+
+func (svc *SetupService) waitForTelegramVerification(secret, code string, timeout time.Duration) (int64, error) {
+	bot, err := tb.NewBot(tb.Settings{
+		Token:  secret,
+		Poller: &tb.LongPoller{Timeout: 10 * time.Second},
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	done := make(chan int64, 1)
+	bot.Handle(tb.OnText, func(c tb.Context) error {
+		if strings.TrimSpace(c.Text()) != code {
+			return nil
+		}
+		sender := c.Sender()
+		if sender == nil {
+			return nil
+		}
+		select {
+		case done <- sender.ID:
+		default:
+		}
+		_ = c.Send("Verification received. You can return to the setup.")
+		return nil
+	})
+
+	go bot.Start()
+	defer bot.Stop()
+
+	select {
+	case userID := <-done:
+		return userID, nil
+	case <-time.After(timeout):
+		return 0, errors.New("telegram verification timed out")
+	}
 }
 
 func confirm(reader *bufio.Reader, prompt string) bool {
