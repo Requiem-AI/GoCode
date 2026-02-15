@@ -115,6 +115,7 @@ func (svc *TelegramService) setupHandlers() {
 	svc.Bot.Handle("/new", svc.guardHandler(svc.onTopic))
 	svc.Bot.Handle("/delete", svc.guardHandler(svc.onDeleteTopic))
 	svc.Bot.Handle("/github", svc.guardHandler(svc.onGithub))
+	svc.Bot.Handle("/pull", svc.guardHandler(svc.onPull))
 	svc.Bot.Handle("/preview", svc.guardHandler(svc.onPreview))
 	svc.Bot.Handle("/restart", svc.guardHandler(svc.onRestart))
 
@@ -952,6 +953,26 @@ func (svc *TelegramService) onPreview(c tb.Context) error {
 		msgText := fmt.Sprintf("Preview ready:\nURL: %s\nTunnel: %s\nPort: %d", session.URL, session.Tunnel, session.Port)
 		return c.Send(msgText, &tb.SendOptions{ThreadID: msg.ThreadID})
 	}
+}
+
+func (svc *TelegramService) onPull(c tb.Context) error {
+	msg := c.Message()
+	if msg == nil || !msg.TopicMessage || msg.ThreadID == 0 {
+		return c.Send("Use /pull inside a topic.")
+	}
+
+	repo, err := svc.ensureRepo(c.Chat(), msg.ThreadID)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to ensure repo for pull")
+		return c.Send("Couldn't prepare the repo for this topic.", &tb.SendOptions{ThreadID: msg.ThreadID})
+	}
+
+	if err := svc.git.PullMain(repo); err != nil {
+		log.Error().Err(err).Str("repo_path", repo.Path).Msg("failed to pull main")
+		return c.Send(fmt.Sprintf("Failed to pull main: %s", err.Error()), &tb.SendOptions{ThreadID: msg.ThreadID})
+	}
+
+	return c.Send("Pulled latest changes on main.", &tb.SendOptions{ThreadID: msg.ThreadID})
 }
 
 func (svc *TelegramService) onRestart(c tb.Context) error {
