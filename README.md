@@ -72,6 +72,8 @@ go run ./runtime
 - `/new <name> [repo-url|repo-path]` creates a topic with a repo context.
 - `/clear` clears the current topic context.
 - `/delete` deletes the current topic and its repo.
+- `/branch <name>` creates or checks out a working branch in the topic repo.
+- `/commit [message]` stages all changes, commits, pushes the current branch, and opens a PR.
 - `/github` toggles GitHub auth mode (see bot replies for details).
 - `/preview [start|status|stop] [ngrok|tailscale]` starts a web preview using `yarn dev`.
 

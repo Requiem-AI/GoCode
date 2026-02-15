@@ -275,6 +275,8 @@ func (svc *SetupService) registerTelegramBotCommands(secret string) error {
 		{Text: "clear", Description: "Clear the current topic context"},
 		{Text: "delete", Description: "Delete the current topic and repo"},
 		{Text: "github", Description: "Configure GitHub auth (/github ssh|status|logout)"},
+		{Text: "branch", Description: "Create/switch working branch (/branch <name>)"},
+		{Text: "commit", Description: "Commit, push, and open PR (/commit [message])"},
 		{Text: "preview", Description: "Start/stop web preview (/preview [start|status|stop])"},
 	}
 

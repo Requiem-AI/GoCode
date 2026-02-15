@@ -115,6 +115,8 @@ func (svc *TelegramService) setupHandlers() {
 	svc.Bot.Handle("/delete", svc.guardHandler(svc.onDeleteTopic))
 	svc.Bot.Handle("/github", svc.guardHandler(svc.onGithub))
 	svc.Bot.Handle("/preview", svc.guardHandler(svc.onPreview))
+	svc.Bot.Handle("/branch", svc.guardHandler(svc.onBranch))
+	svc.Bot.Handle("/commit", svc.guardHandler(svc.onCommit))
 	svc.Bot.Handle("/restart", svc.guardHandler(svc.onRestart))
 
 	svc.Bot.Handle(tb.OnText, svc.guardHandler(svc.onText))
@@ -624,6 +626,22 @@ func (svc *TelegramService) createFeatureBranch(repo *GitRepo, feature string) (
 	return svc.git.CreateFeatureBranch(repo, feature)
 }
 
+func (svc *TelegramService) createWorkingBranch(repo *GitRepo, branch string) (string, error) {
+	if svc.git == nil {
+		return "", errors.New("git service not available")
+	}
+
+	return svc.git.CreateWorkingBranch(repo, branch)
+}
+
+func (svc *TelegramService) commitAndOpenPR(repo *GitRepo, message string) (*CommitPRResult, error) {
+	if svc.git == nil {
+		return nil, errors.New("git service not available")
+	}
+
+	return svc.git.CommitPushAndOpenPR(repo, message)
+}
+
 func (svc *TelegramService) parseTopicArgs(payload string) (string, string, string) {
 	fields := strings.Fields(payload)
 	if len(fields) == 0 {
@@ -908,6 +926,60 @@ func (svc *TelegramService) onPreview(c tb.Context) error {
 		msgText := fmt.Sprintf("Preview ready:\nURL: %s\nTunnel: %s\nPort: %d", session.URL, session.Tunnel, session.Port)
 		return c.Send(msgText, &tb.SendOptions{ThreadID: msg.ThreadID})
 	}
+}
+
+func (svc *TelegramService) onBranch(c tb.Context) error {
+	msg := c.Message()
+	if msg == nil {
+		return nil
+	}
+	if !msg.TopicMessage || msg.ThreadID == 0 {
+		return c.Send("Use /branch inside a topic.")
+	}
+
+	branch := strings.TrimSpace(msg.Payload)
+	if branch == "" {
+		return c.Send("Usage: /branch <name>", &tb.SendOptions{ThreadID: msg.ThreadID})
+	}
+
+	repo, err := svc.ensureRepo(c.Chat(), msg.ThreadID)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to ensure repo for branch")
+		return c.Send("Couldn't prepare the repo for this topic.", &tb.SendOptions{ThreadID: msg.ThreadID})
+	}
+
+	selectedBranch, err := svc.createWorkingBranch(repo, branch)
+	if err != nil {
+		log.Error().Err(err).Str("branch", branch).Msg("failed to create working branch")
+		return c.Send(fmt.Sprintf("Failed to create branch: %s", err.Error()), &tb.SendOptions{ThreadID: msg.ThreadID})
+	}
+
+	return c.Send(fmt.Sprintf("Checked out branch %s.", selectedBranch), &tb.SendOptions{ThreadID: msg.ThreadID})
+}
+
+func (svc *TelegramService) onCommit(c tb.Context) error {
+	msg := c.Message()
+	if msg == nil {
+		return nil
+	}
+	if !msg.TopicMessage || msg.ThreadID == 0 {
+		return c.Send("Use /commit inside a topic.")
+	}
+
+	repo, err := svc.ensureRepo(c.Chat(), msg.ThreadID)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to ensure repo for commit")
+		return c.Send("Couldn't prepare the repo for this topic.", &tb.SendOptions{ThreadID: msg.ThreadID})
+	}
+
+	result, err := svc.commitAndOpenPR(repo, msg.Payload)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to commit and open pr")
+		return c.Send(fmt.Sprintf("Commit flow failed: %s", err.Error()), &tb.SendOptions{ThreadID: msg.ThreadID})
+	}
+
+	resp := fmt.Sprintf("Committed and pushed to %s\nMessage: %s\nPR: %s", result.Branch, result.CommitMessage, result.PRURL)
+	return c.Send(resp, &tb.SendOptions{ThreadID: msg.ThreadID})
 }
 
 func (svc *TelegramService) onRestart(c tb.Context) error {

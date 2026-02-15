@@ -35,6 +35,12 @@ type GitService struct {
 	repos map[string]*GitRepo
 }
 
+type CommitPRResult struct {
+	Branch        string
+	CommitMessage string
+	PRURL         string
+}
+
 func (svc GitService) Id() string {
 	return GIT_SVC
 }
@@ -346,6 +352,89 @@ func (svc *GitService) CreateFeatureBranch(repo *GitRepo, feature string) (strin
 	return branch, nil
 }
 
+func (svc *GitService) CreateWorkingBranch(repo *GitRepo, name string) (string, error) {
+	if repo == nil {
+		return "", errors.New("repo is nil")
+	}
+
+	branch := strings.TrimSpace(name)
+	if branch == "" {
+		return "", errors.New("branch name is required")
+	}
+
+	if err := svc.validateBranchName(repo.Path, branch); err != nil {
+		return "", err
+	}
+
+	if err := svc.checkoutBranch(repo.Path, branch); err != nil {
+		return "", err
+	}
+
+	return branch, nil
+}
+
+func (svc *GitService) CommitPushAndOpenPR(repo *GitRepo, message string) (*CommitPRResult, error) {
+	if repo == nil {
+		return nil, errors.New("repo is nil")
+	}
+
+	branch, err := svc.currentBranch(repo.Path)
+	if err != nil {
+		return nil, err
+	}
+	if branch == "" || branch == "HEAD" {
+		return nil, errors.New("current branch is detached; create or checkout a branch first")
+	}
+
+	baseBranch := strings.TrimSpace(repo.DefaultBranch)
+	if baseBranch == "" {
+		baseBranch = "main"
+	}
+	if branch == baseBranch {
+		return nil, fmt.Errorf("current branch is %q; create a working branch before opening a PR", baseBranch)
+	}
+
+	if err := svc.runGit(repo.Path, "add", "-A"); err != nil {
+		return nil, err
+	}
+
+	changedFiles, err := svc.stagedFiles(repo.Path)
+	if err != nil {
+		return nil, err
+	}
+	if len(changedFiles) == 0 {
+		return nil, errors.New("no changes to commit")
+	}
+
+	commitMessage := strings.TrimSpace(message)
+	if commitMessage == "" {
+		commitMessage = autoCommitMessage(changedFiles)
+	}
+
+	if err := svc.runGit(repo.Path, "commit", "-m", commitMessage); err != nil {
+		return nil, err
+	}
+
+	if _, err := svc.runGitOutput(repo.Path, "remote", "get-url", "origin"); err != nil {
+		return nil, errors.New("missing git remote 'origin'")
+	}
+
+	if err := svc.runGit(repo.Path, "push", "-u", "origin", branch); err != nil {
+		return nil, err
+	}
+
+	prURL, err := svc.createPullRequest(repo.Path, branch, baseBranch, commitMessage)
+	if err != nil {
+		return nil, err
+	}
+
+	return &CommitPRResult{
+		Branch:        branch,
+		CommitMessage: commitMessage,
+		PRURL:         prURL,
+	}, nil
+}
+
 func (svc *GitService) initRepo(repoPath string) error {
 	if err := os.MkdirAll(repoPath, 0o775); err != nil {
 		return err
@@ -425,6 +514,101 @@ func (svc *GitService) checkoutBranch(repoPath, branch string) error {
 	return svc.runGit(repoPath, "checkout", "-b", branch)
 }
 
+func (svc *GitService) validateBranchName(repoPath, branch string) error {
+	cmd := exec.CommandContext(context.Background(), "git", "-C", repoPath, "check-ref-format", "--branch", branch)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(output))
+		if msg == "" {
+			return fmt.Errorf("invalid branch name %q", branch)
+		}
+		return fmt.Errorf("invalid branch name %q: %s", branch, msg)
+	}
+	return nil
+}
+
+func (svc *GitService) currentBranch(repoPath string) (string, error) {
+	branch, err := svc.runGitOutput(repoPath, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(branch), nil
+}
+
+func (svc *GitService) stagedFiles(repoPath string) ([]string, error) {
+	out, err := svc.runGitOutput(repoPath, "diff", "--cached", "--name-only")
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(out) == "" {
+		return nil, nil
+	}
+
+	lines := strings.Split(out, "\n")
+	files := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			files = append(files, line)
+		}
+	}
+	return files, nil
+}
+
+func (svc *GitService) createPullRequest(repoPath, headBranch, baseBranch, title string) (string, error) {
+	if _, err := exec.LookPath("gh"); err != nil {
+		return "", errors.New("GitHub CLI (gh) is required to open a PR")
+	}
+
+	prTitle := strings.TrimSpace(title)
+	if prTitle == "" {
+		prTitle = "Update changes"
+	}
+	prBody := "Automated PR created by GoCode."
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "gh", "pr", "create",
+		"--base", baseBranch,
+		"--head", headBranch,
+		"--title", prTitle,
+		"--body", prBody,
+	)
+	cmd.Dir = repoPath
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		url := strings.TrimSpace(string(output))
+		if url != "" {
+			return url, nil
+		}
+	}
+
+	existingURL, viewErr := svc.existingPullRequestURL(repoPath, headBranch)
+	if viewErr == nil && existingURL != "" {
+		return existingURL, nil
+	}
+
+	out := strings.TrimSpace(string(output))
+	if out == "" && err != nil {
+		return "", fmt.Errorf("failed to create PR: %w", err)
+	}
+	return "", fmt.Errorf("failed to create PR: %s", out)
+}
+
+func (svc *GitService) existingPullRequestURL(repoPath, headBranch string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "gh", "pr", "view", "--head", headBranch, "--json", "url", "--jq", ".url")
+	cmd.Dir = repoPath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
 func (svc *GitService) branchExists(repoPath, branch string) bool {
 	cmd := exec.CommandContext(context.Background(), "git", "-C", repoPath, "rev-parse", "--verify", branch)
 	return cmd.Run() == nil
@@ -473,6 +657,20 @@ func slugify(in string) string {
 	out := slugRe.ReplaceAllString(in, "-")
 	out = strings.Trim(out, "-")
 	return out
+}
+
+func autoCommitMessage(files []string) string {
+	count := len(files)
+	if count == 0 {
+		return "Update changes"
+	}
+	if count == 1 {
+		return fmt.Sprintf("Update %s", files[0])
+	}
+	if count == 2 {
+		return fmt.Sprintf("Update %s and %s", files[0], files[1])
+	}
+	return fmt.Sprintf("Update %d files", count)
 }
 
 func topicKey(chatID int64, threadID int) string {
