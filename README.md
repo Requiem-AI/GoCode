@@ -40,9 +40,12 @@ USER_ID=1234567890
 PREVIEW_TUNNEL=ngrok
 NGROK_BIN=ngrok
 TAILSCALE_BIN=tailscale
+TELEGRAM_MAIN_CHAT_ID=-1001234567890
+TELEGRAM_ONLINE_MESSAGE="Bot is online."
 ```
 
 Set `USER_ID` to your Telegram numeric user ID to restrict the bot to only your messages.
+Set `TELEGRAM_MAIN_CHAT_ID` to force where startup messages are sent; otherwise GoCode uses the first chat ID from saved topic contexts.
 
 On first run, GoCode will prompt for Codex login if needed and can set up the Telegram token in `.env`.
 

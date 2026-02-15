@@ -4,13 +4,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/requiem-ai/gocode/context"
@@ -59,9 +60,8 @@ func (svc *TelegramService) Configure(ctx *context.Context) (err error) {
 	svc.Bot, err = tb.NewBot(tb.Settings{
 		Token: os.Getenv("TELEGRAM_SECRET"),
 		Poller: &tb.LongPoller{
-			Timeout: 3 * time.Second,
+			Timeout: 30 * time.Second,
 		},
-		Client: &http.Client{Timeout: 10 * time.Second},
 		OnError: func(err error, c tb.Context) {
 			log.Error().Err(err).Msg("Telegram bot error")
 		},
@@ -95,6 +95,7 @@ func (svc *TelegramService) Start() error {
 
 	svc.setupHandlers()
 	svc.setupEvents()
+	svc.sendOnlineMessage()
 
 	svc.Bot.Start()
 
@@ -114,6 +115,7 @@ func (svc *TelegramService) setupHandlers() {
 	svc.Bot.Handle("/delete", svc.guardHandler(svc.onDeleteTopic))
 	svc.Bot.Handle("/github", svc.guardHandler(svc.onGithub))
 	svc.Bot.Handle("/preview", svc.guardHandler(svc.onPreview))
+	svc.Bot.Handle("/restart", svc.guardHandler(svc.onRestart))
 
 	svc.Bot.Handle(tb.OnText, svc.guardHandler(svc.onText))
 
@@ -132,8 +134,67 @@ func (svc *TelegramService) setupEvents() {
 	svc.Bot.Handle(tb.OnTopicCreated, svc.guardHandler(svc.onTopicCreated))
 }
 
+func (svc *TelegramService) sendOnlineMessage() {
+	if svc.Bot == nil {
+		return
+	}
+
+	chatID, ok := svc.mainChatID()
+	if !ok {
+		log.Warn().Msg("skipping online message: main chat id not configured or discoverable")
+		return
+	}
+
+	message := strings.TrimSpace(os.Getenv("TELEGRAM_ONLINE_MESSAGE"))
+	if message == "" {
+		message = "Bot is online."
+	}
+
+	_, err := svc.Bot.Send(&tb.Chat{ID: chatID}, message)
+	if err != nil {
+		log.Error().Err(err).Int64("chat_id", chatID).Msg("failed to send online message")
+		return
+	}
+
+	log.Info().Int64("chat_id", chatID).Msg("sent online message to main chat")
+}
+
+func (svc *TelegramService) mainChatID() (int64, bool) {
+	raw := strings.TrimSpace(os.Getenv("TELEGRAM_MAIN_CHAT_ID"))
+	if raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			log.Error().Err(err).Str("value", raw).Msg("invalid TELEGRAM_MAIN_CHAT_ID")
+			return 0, false
+		}
+		return value, true
+	}
+
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+	for key := range svc.topicContexts {
+		chatID, _, ok := parseTopicKey(key)
+		if ok {
+			return chatID, true
+		}
+	}
+
+	return 0, false
+}
+
 func (svc *TelegramService) guardHandler(fn tb.HandlerFunc) tb.HandlerFunc {
 	return func(c tb.Context) error {
+		if c != nil {
+			logger := log.Info()
+			if chat := c.Chat(); chat != nil {
+				logger = logger.Int64("chat_id", chat.ID).Str("chat_type", string(chat.Type))
+			}
+			if msg := c.Message(); msg != nil {
+				logger = logger.Int("thread_id", msg.ThreadID)
+			}
+			logger.Msg("inbound telegram update")
+		}
+
 		if !svc.isAllowedUser(c) {
 			return nil
 		}
@@ -847,6 +908,107 @@ func (svc *TelegramService) onPreview(c tb.Context) error {
 		msgText := fmt.Sprintf("Preview ready:\nURL: %s\nTunnel: %s\nPort: %d", session.URL, session.Tunnel, session.Port)
 		return c.Send(msgText, &tb.SendOptions{ThreadID: msg.ThreadID})
 	}
+}
+
+func (svc *TelegramService) onRestart(c tb.Context) error {
+	msg := c.Message()
+	if msg == nil {
+		return nil
+	}
+
+	opts := &tb.SendOptions{}
+	if msg.TopicMessage && msg.ThreadID != 0 {
+		opts.ThreadID = msg.ThreadID
+	}
+	if err := c.Send("Restarting gocode...", opts); err != nil {
+		return err
+	}
+
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		if err := svc.restartProcess(); err != nil {
+			log.Error().Err(err).Msg("failed to restart process")
+		}
+	}()
+
+	return nil
+}
+
+func (svc *TelegramService) restartProcess() error {
+	projectDir, err := svc.resolveProjectDir()
+	if err != nil {
+		return err
+	}
+
+	restartCommands := [][]string{
+		{"go", "mod", "tidy"},
+		{"go", "mod", "vendor"},
+		{"go", "build", "./runtime/gocode.go"},
+	}
+	for _, args := range restartCommands {
+		if err := svc.runRestartCommand(projectDir, args...); err != nil {
+			return err
+		}
+	}
+
+	executablePath, err := os.Executable()
+	if err != nil {
+		return err
+	}
+
+	cmd := exec.Command(executablePath, os.Args[1:]...)
+	cmd.Env = os.Environ()
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Dir = projectDir
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	log.Info().Int("new_pid", cmd.Process.Pid).Msg("spawned replacement gocode process")
+	return syscall.Kill(os.Getpid(), syscall.SIGTERM)
+}
+
+func (svc *TelegramService) resolveProjectDir() (string, error) {
+	if wd, err := os.Getwd(); err == nil {
+		if _, statErr := os.Stat(filepath.Join(wd, "go.mod")); statErr == nil {
+			return wd, nil
+		}
+	}
+
+	executablePath, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	executableDir := filepath.Dir(executablePath)
+	if _, statErr := os.Stat(filepath.Join(executableDir, "go.mod")); statErr == nil {
+		return executableDir, nil
+	}
+
+	return "", errors.New("could not determine project root containing go.mod")
+}
+
+func (svc *TelegramService) runRestartCommand(projectDir string, args ...string) error {
+	if len(args) == 0 {
+		return errors.New("restart command was empty")
+	}
+
+	log.Info().Str("command", strings.Join(args, " ")).Msg("running restart command")
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Dir = projectDir
+	cmd.Env = os.Environ()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		out := strings.TrimSpace(string(output))
+		if out == "" {
+			return fmt.Errorf("restart command failed: %s: %w", strings.Join(args, " "), err)
+		}
+		return fmt.Errorf("restart command failed: %s: %w: %s", strings.Join(args, " "), err, out)
+	}
+
+	return nil
 }
 
 func (svc *TelegramService) startGithubSSH(c tb.Context) error {
