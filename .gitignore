@@ -33,3 +33,10 @@ go.work.sum
 
 .spec/
 repos/
+
+data/
+gh_ssh.key
+gh_ssh.key.pub
+gocode
+run.sh
+vendor/
