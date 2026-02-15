@@ -277,6 +277,7 @@ func (svc *SetupService) registerTelegramBotCommands(secret string) error {
 		{Text: "github", Description: "Configure GitHub auth (/github ssh|status|logout)"},
 		{Text: "branch", Description: "Create/switch working branch (/branch <name>)"},
 		{Text: "commit", Description: "Commit, push, and open PR (/commit [message])"},
+		{Text: "pull", Description: "Checkout main and run git pull"},
 		{Text: "preview", Description: "Start/stop web preview (/preview [start|status|stop])"},
 	}
 

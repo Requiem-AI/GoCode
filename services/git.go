@@ -435,6 +435,18 @@ func (svc *GitService) CommitPushAndOpenPR(repo *GitRepo, message string) (*Comm
 	}, nil
 }
 
+func (svc *GitService) PullMain(repo *GitRepo) error {
+	if repo == nil {
+		return errors.New("repo is nil")
+	}
+
+	if err := svc.checkoutBranch(repo.Path, "main"); err != nil {
+		return err
+	}
+
+	return svc.runGit(repo.Path, "pull")
+}
+
 func (svc *GitService) initRepo(repoPath string) error {
 	if err := os.MkdirAll(repoPath, 0o775); err != nil {
 		return err
