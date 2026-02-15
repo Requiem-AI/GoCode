@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/requiem-ai/gocode/context"
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	tb "gopkg.in/telebot.v3"
 )
@@ -63,7 +64,7 @@ func (svc *TelegramService) Configure(ctx *context.Context) (err error) {
 			Timeout: 30 * time.Second,
 		},
 		OnError: func(err error, c tb.Context) {
-			log.Error().Err(err).Msg("Telegram bot error")
+			svc.decorateTelegramEvent(log.Error().Err(err), c).Msg("telegram bot error")
 		},
 	})
 	if err != nil {
@@ -185,46 +186,89 @@ func (svc *TelegramService) mainChatID() (int64, bool) {
 func (svc *TelegramService) guardHandler(fn tb.HandlerFunc) tb.HandlerFunc {
 	return func(c tb.Context) error {
 		if c != nil {
-			logger := log.Info()
-			if chat := c.Chat(); chat != nil {
-				logger = logger.Int64("chat_id", chat.ID).Str("chat_type", string(chat.Type))
-			}
-			if msg := c.Message(); msg != nil {
-				logger = logger.Int("thread_id", msg.ThreadID)
-			}
-			logger.Msg("inbound telegram update")
+			svc.decorateTelegramEvent(log.Info(), c).Msg("inbound telegram update")
 		}
 
-		if !svc.isAllowedUser(c) {
+		allowed, reason := svc.isAllowedUser(c)
+		if !allowed {
+			svc.decorateTelegramEvent(
+				log.Warn().
+					Str("reason", reason).
+					Int64("allowed_user_id", svc.allowedUserID),
+				c,
+			).Msg("telegram update blocked")
 			return nil
 		}
-		return fn(c)
+
+		if err := fn(c); err != nil {
+			svc.decorateTelegramEvent(log.Error().Err(err), c).Msg("telegram handler returned error")
+			return err
+		}
+
+		return nil
 	}
 }
 
-func (svc *TelegramService) isAllowedUser(c tb.Context) bool {
+func (svc *TelegramService) decorateTelegramEvent(event *zerolog.Event, c tb.Context) *zerolog.Event {
+	if event == nil || c == nil {
+		return event
+	}
+
+	if chat := c.Chat(); chat != nil {
+		event = event.Int64("group_id", chat.ID).Str("chat_type", string(chat.Type))
+	}
+
+	if sender := c.Sender(); sender != nil {
+		event = event.Int64("user_id", sender.ID).Str("sender_username", sender.Username)
+	}
+
+	if msg := c.Message(); msg != nil {
+		text := strings.TrimSpace(msg.Text)
+		command := ""
+		if strings.HasPrefix(text, "/") {
+			fields := strings.Fields(strings.TrimPrefix(text, "/"))
+			if len(fields) > 0 {
+				command = fields[0]
+			}
+		}
+
+		event = event.
+			Int("thread_id", msg.ThreadID).
+			Bool("topic_message", msg.TopicMessage).
+			Str("message_text", msg.Text).
+			Str("message_payload", msg.Payload)
+		if command != "" {
+			event = event.Str("command", command)
+		}
+	}
+
+	if callback := c.Callback(); callback != nil {
+		event = event.
+			Str("callback_data", callback.Data).
+			Str("callback_unique", callback.Unique)
+	}
+
+	return event
+}
+
+func (svc *TelegramService) isAllowedUser(c tb.Context) (bool, string) {
 	if svc.allowedUserID == 0 {
-		return true
+		return true, ""
 	}
 	if c == nil {
-		return false
+		return false, "missing_context"
 	}
 	sender := c.Sender()
 	if sender == nil {
-		return false
+		return false, "missing_sender"
 	}
 	if sender.ID == svc.Bot.Me.ID {
-		return false // Ignore bot msgs
+		return false, "sender_is_bot" // Ignore bot msgs
 	}
 	if sender.ID != svc.allowedUserID {
-		log.Warn().
-			Int64("allowed_user_id", svc.allowedUserID).
-			Int64("sender_id", sender.ID).
-			Str("sender_username", sender.Username).
-			Msg("telegram message ignored: sender not allowed")
-		return false
+		return false, "sender_not_allowed"
 	}
-	return true
+	return true, ""
 }
 
 func (svc *TelegramService) parseAllowedUserID() (int64, error) {
