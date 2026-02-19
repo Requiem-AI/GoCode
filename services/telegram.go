@@ -425,6 +425,20 @@ func (svc *TelegramService) onTopic(c tb.Context) error {
 	if name == "" {
 		return c.Send("Usage: /new <name> [repo-url|repo-path]")
 	}
+
+	if repoURL == "" && repoPath == "" {
+		if svc.git == nil {
+			return c.Send("Git service is not available.")
+		}
+
+		createdRepoURL, err := svc.git.CreateGitHubRepo(name)
+		if err != nil {
+			log.Error().Err(err).Str("name", name).Msg("failed to create github repo for topic")
+			return c.Send(fmt.Sprintf("Failed to create GitHub repo: %s", err.Error()))
+		}
+		repoURL = createdRepoURL
+	}
+
 	if repoURL != "" || repoPath != "" {
 		if existingThreadID, ok := svc.findTopicForRepo(repoURL, repoPath); ok {
 			return c.Send(fmt.Sprintf("Repo already linked to topic %d. Use that topic or delete it before creating another.", existingThreadID))

@@ -153,6 +153,10 @@ func (svc *SetupService) runGithubSSHSetup() error {
 	}
 	git := gitSvc.(*GitService)
 
+	if err := svc.runGitHubOwnerSetup(reader, git); err != nil {
+		return err
+	}
+
 	enabled := git.GitHubUseSSH()
 	keyPathEnv := strings.TrimSpace(os.Getenv("GITHUB_SSH_KEY_PATH"))
 	if enabled || keyPathEnv != "" {
@@ -204,6 +208,23 @@ func (svc *SetupService) runGithubSSHSetup() error {
 	}
 	fmt.Fprintln(os.Stdout, "")
 
+	return nil
+}
+
+func (svc *SetupService) runGitHubOwnerSetup(reader *bufio.Reader, git *GitService) error {
+	if strings.TrimSpace(os.Getenv("GITHUB_OWNER")) != "" {
+		return nil
+	}
+
+	owner, err := promptWithDefault(reader, "GitHub owner/org for new repos", "", "Requiem-AI")
+	if err != nil {
+		return err
+	}
+	if err := git.SetGitHubOwner(owner); err != nil {
+		return err
+	}
+
+	fmt.Fprintln(os.Stdout, "GitHub owner saved to .env.")
 	return nil
 }
 
