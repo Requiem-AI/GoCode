@@ -82,6 +82,90 @@ func (svc *GitService) EnsureTopicRepoFrom(chatID int64, threadID int, repoURL, 
 	return svc.ensureTopicRepo(chatID, threadID, repoURL, token)
 }
 
+func (svc *GitService) CreateGitHubRepo(name string) (string, error) {
+	repoName := strings.TrimSpace(name)
+	if repoName == "" {
+		return "", errors.New("repo name is required")
+	}
+	if strings.Contains(repoName, "/") {
+		return "", errors.New("repo name must not include owner; it is configured by GITHUB_OWNER")
+	}
+
+	owner := svc.GitHubOwner()
+	if owner == "" {
+		return "", errors.New("GITHUB_OWNER is not set")
+	}
+	fullName := owner + "/" + repoName
+
+	if _, err := exec.LookPath("gh"); err != nil {
+		return "", errors.New("GitHub CLI (gh) is required to create a repository")
+	}
+
+	createCtx, createCancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer createCancel()
+
+	createCmd := exec.CommandContext(createCtx, "gh", "repo", "create", fullName, "--private")
+	createOut, createErr := createCmd.CombinedOutput()
+	if createErr != nil {
+		msg := strings.TrimSpace(string(createOut))
+		if msg == "" {
+			return "", fmt.Errorf("failed to create GitHub repository: %w", createErr)
+		}
+		return "", fmt.Errorf("failed to create GitHub repository: %s", msg)
+	}
+
+	viewCtx, viewCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer viewCancel()
+
+	viewCmd := exec.CommandContext(viewCtx, "gh", "repo", "view", fullName, "--json", "url", "--jq", ".url")
+	viewOut, viewErr := viewCmd.CombinedOutput()
+	if viewErr != nil {
+		msg := strings.TrimSpace(string(viewOut))
+		if msg == "" {
+			return "", fmt.Errorf("repository created, but failed to resolve its URL: %w", viewErr)
+		}
+		return "", fmt.Errorf("repository created, but failed to resolve its URL: %s", msg)
+	}
+
+	repoURL := strings.TrimSpace(string(viewOut))
+	if repoURL == "" {
+		return "", errors.New("repository created, but returned an empty URL")
+	}
+
+	return repoURL, nil
+}
+
+func (svc *GitService) GitHubOwner() string {
+	owner := strings.TrimSpace(os.Getenv("GITHUB_OWNER"))
+	if owner == "" {
+		return "Requiem-AI"
+	}
+	return owner
+}
+
+func (svc *GitService) SetGitHubOwner(owner string) error {
+	trimmed := strings.TrimSpace(owner)
+	if trimmed == "" {
+		return errors.New("github owner is required")
+	}
+	if strings.Contains(trimmed, "/") {
+		return errors.New("github owner must not include '/'")
+	}
+
+	if err := os.Setenv("GITHUB_OWNER", trimmed); err != nil {
+		return err
+	}
+
+	envPath, err := envFilePath()
+	if err != nil {
+		return err
+	}
+
+	return updateEnvFile(envPath, map[string]string{
+		"GITHUB_OWNER": trimmed,
+	})
+}
+
 func (svc *GitService) EnsureTopicRepoFromPath(chatID int64, threadID int, repoPath string) (*GitRepo, error) {
 	if threadID == 0 {
 		return nil, errors.New("missing topic thread id")

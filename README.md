@@ -33,6 +33,7 @@ TELEGRAM_SECRET=your-telegram-bot-token
 LOG_LEVEL=info
 CODEX_BIN=codex
 GIT_REPO_ROOT=./data/repos
+GITHUB_OWNER=Requiem-AI
 GITHUB_USE_SSH=true
 GITHUB_SSH_KEY_PATH=~/.ssh/id_ed25519
 TELEGRAM_TOPIC_CONTEXTS_PATH=./data/telegram_topics.json
@@ -47,7 +48,7 @@ TELEGRAM_ONLINE_MESSAGE="Bot is online."
 Set `USER_ID` to your Telegram numeric user ID to restrict the bot to only your messages.
 Set `TELEGRAM_MAIN_CHAT_ID` to force where startup messages are sent; otherwise GoCode uses the first chat ID from saved topic contexts.
 
-On first run, GoCode will prompt for Codex login if needed and can set up the Telegram token in `.env`.
+On first run, GoCode will prompt for Codex login if needed and can set up the Telegram token and GitHub owner in `.env`.
 
 ## Build
 
@@ -70,6 +71,7 @@ go run ./runtime
 ## Usage
 
 - `/new <name> [repo-url|repo-path]` creates a topic with a repo context.
+- `/new <name>` creates a private repo under `GITHUB_OWNER` via `gh`, then binds it to the topic.
 - `/clear` clears the current topic context.
 - `/delete` deletes the current topic and its repo.
 - `/branch <name>` creates or checks out a working branch in the topic repo.
