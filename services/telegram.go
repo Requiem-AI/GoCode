@@ -314,7 +314,11 @@ func (svc *TelegramService) onText(c tb.Context) error {
 
 		_, err = svc.Bot.Send(c.Chat(),
 			resp,
-			&tb.SendOptions{ParseMode: tb.ModeMarkdown})
+			&tb.SendOptions{ParseMode: tb.ModeMarkdownV2})
+		if err != nil {
+			// Fallback to plain text if Markdown parsing fails
+			_, err = svc.Bot.Send(c.Chat(), resp, &tb.SendOptions{})
+		}
 		return err
 	}
 
@@ -348,6 +352,10 @@ func (svc *TelegramService) onText(c tb.Context) error {
 	_, err = svc.Bot.Send(c.Chat(),
 		resp,
 		&tb.SendOptions{ThreadID: msg.ThreadID, ParseMode: tb.ModeMarkdown})
+	if err != nil {
+		// Fallback to plain text if Markdown parsing fails
+		_, err = svc.Bot.Send(c.Chat(), resp, &tb.SendOptions{ThreadID: msg.ThreadID})
+	}
 	return err
 }
 
