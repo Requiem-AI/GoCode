@@ -304,23 +304,7 @@ func (svc *TelegramService) onText(c tb.Context) error {
 			Emoji: "👍",
 		}}})
 
-		resp, err := svc.agent.Run("", c.Text())
-		if err != nil {
-			log.Error().Err(err).Msg("failed to run agent request (main)")
-			return c.Send("Agent failed to run.")
-		}
-
-		_ = svc.Bot.Notify(c.Chat(), tb.Typing)
-
-		escaped := escapeMarkdownV2(resp)
-		_, err = svc.Bot.Send(c.Chat(),
-			escaped,
-			&tb.SendOptions{ParseMode: tb.ModeMarkdownV2})
-		if err != nil {
-			// Fallback to plain text if MarkdownV2 parsing still fails
-			_, err = svc.Bot.Send(c.Chat(), resp, &tb.SendOptions{})
-		}
-		return err
+		return svc.runAgentWithPendingUpdates(c.Chat(), &tb.SendOptions{}, "", c.Text())
 	}
 
 	log.Info().Str("text", msg.Text).Int("topic", msg.ThreadID).Msg("onText topic")
@@ -342,23 +326,121 @@ func (svc *TelegramService) onText(c tb.Context) error {
 		Emoji: "👍",
 	}}})
 
-	resp, err := svc.agent.Run(repo.Path, c.Text())
-	if err != nil {
-		log.Error().Err(err).Msg("failed to run agent request")
-		return c.Send("Agent failed to run.")
+	return svc.runAgentWithPendingUpdates(c.Chat(), &tb.SendOptions{ThreadID: msg.ThreadID}, repo.Path, c.Text())
+}
+
+func (svc *TelegramService) runAgentWithPendingUpdates(chat *tb.Chat, opts *tb.SendOptions, repoPath, prompt string) error {
+	if opts == nil {
+		opts = &tb.SendOptions{}
 	}
 
-	_ = svc.Bot.Notify(c.Chat(), tb.Typing, msg.ThreadID)
+	if opts.ThreadID != 0 {
+		_ = svc.Bot.Notify(chat, tb.Typing, opts.ThreadID)
+	} else {
+		_ = svc.Bot.Notify(chat, tb.Typing)
+	}
+
+	started := time.Now()
+	pendingMessageID := 0
+	pendingOpts := cloneSendOptions(opts)
+	pendingOpts.DisableNotification = true
+
+	stopUpdates := make(chan struct{})
+	updatesDone := make(chan struct{})
+	go func() {
+		defer close(updatesDone)
+
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-stopUpdates:
+				return
+			case <-ticker.C:
+				elapsed := int(time.Since(started).Seconds())
+				updateText := fmt.Sprintf("Still thinking... (%ds elapsed)", elapsed)
+				nextMessageID, updateErr := svc.editOrSendByMessageID(chat, pendingOpts, pendingMessageID, updateText, "")
+				if updateErr != nil {
+					log.Warn().Err(updateErr).Msg("failed to update pending message")
+					continue
+				}
+				pendingMessageID = nextMessageID
+			}
+		}
+	}()
+
+	resp, runErr := svc.agent.Run(repoPath, prompt)
+	close(stopUpdates)
+	<-updatesDone
+
+	if runErr != nil {
+		log.Error().Err(runErr).Msg("failed to run agent request")
+		return svc.sendFinalResponse(chat, opts, pendingMessageID, "Agent failed to run.", "")
+	}
 
 	escaped := escapeMarkdownV2(resp)
-	_, err = svc.Bot.Send(c.Chat(),
-		escaped,
-		&tb.SendOptions{ThreadID: msg.ThreadID, ParseMode: tb.ModeMarkdownV2})
-	if err != nil {
-		// Fallback to plain text if MarkdownV2 parsing still fails
-		_, err = svc.Bot.Send(c.Chat(), resp, &tb.SendOptions{ThreadID: msg.ThreadID})
+	sendErr := svc.sendFinalResponse(chat, opts, pendingMessageID, escaped, tb.ModeMarkdownV2)
+	if sendErr != nil {
+		sendErr = svc.sendFinalResponse(chat, opts, pendingMessageID, resp, "")
 	}
+	return sendErr
+}
+
+func (svc *TelegramService) sendFinalResponse(chat *tb.Chat, baseOpts *tb.SendOptions, pendingMessageID int, text, parseMode string) error {
+	if pendingMessageID != 0 {
+		pending := tb.StoredMessage{
+			MessageID: strconv.Itoa(pendingMessageID),
+			ChatID:    chat.ID,
+		}
+		if err := svc.Bot.Delete(pending); err != nil {
+			log.Warn().Err(err).Int("message_id", pendingMessageID).Msg("failed to delete pending message")
+		}
+	}
+
+	opts := cloneSendOptions(baseOpts)
+	opts.DisableNotification = false
+	if parseMode != "" {
+		opts.ParseMode = parseMode
+	}
+
+	_, err := svc.Bot.Send(chat, text, opts)
 	return err
+}
+
+func (svc *TelegramService) editOrSendByMessageID(chat *tb.Chat, baseOpts *tb.SendOptions, messageID int, text, parseMode string) (int, error) {
+	opts := cloneSendOptions(baseOpts)
+	if parseMode != "" {
+		opts.ParseMode = parseMode
+	}
+
+	if messageID != 0 {
+		editable := tb.StoredMessage{
+			MessageID: strconv.Itoa(messageID),
+			ChatID:    chat.ID,
+		}
+		editedMsg, err := svc.Bot.Edit(editable, text, opts)
+		if err == nil {
+			if editedMsg != nil && editedMsg.ID != 0 {
+				return editedMsg.ID, nil
+			}
+			return messageID, nil
+		}
+	}
+
+	sentMsg, err := svc.Bot.Send(chat, text, opts)
+	if err != nil {
+		return messageID, err
+	}
+	return sentMsg.ID, nil
+}
+
+func cloneSendOptions(opts *tb.SendOptions) *tb.SendOptions {
+	if opts == nil {
+		return &tb.SendOptions{}
+	}
+	copy := *opts
+	return &copy
 }
 
 func (svc *TelegramService) onClear(c tb.Context) error {
