@@ -1194,23 +1194,7 @@ func (svc *TelegramService) restartProcess() error {
 		}
 	}
 
-	executablePath, err := os.Executable()
-	if err != nil {
-		return err
-	}
-
-	cmd := exec.Command(executablePath, os.Args[1:]...)
-	cmd.Env = os.Environ()
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Dir = projectDir
-
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-
-	log.Info().Int("new_pid", cmd.Process.Pid).Msg("spawned replacement gocode process")
+	log.Info().Msg("restart commands completed; terminating process for supervisor restart")
 	return syscall.Kill(os.Getpid(), syscall.SIGTERM)
 }
 
