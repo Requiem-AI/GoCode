@@ -312,11 +312,12 @@ func (svc *TelegramService) onText(c tb.Context) error {
 
 		_ = svc.Bot.Notify(c.Chat(), tb.Typing)
 
+		escaped := escapeMarkdownV2(resp)
 		_, err = svc.Bot.Send(c.Chat(),
-			resp,
+			escaped,
 			&tb.SendOptions{ParseMode: tb.ModeMarkdownV2})
 		if err != nil {
-			// Fallback to plain text if Markdown parsing fails
+			// Fallback to plain text if MarkdownV2 parsing still fails
 			_, err = svc.Bot.Send(c.Chat(), resp, &tb.SendOptions{})
 		}
 		return err
@@ -349,11 +350,12 @@ func (svc *TelegramService) onText(c tb.Context) error {
 
 	_ = svc.Bot.Notify(c.Chat(), tb.Typing, msg.ThreadID)
 
+	escaped := escapeMarkdownV2(resp)
 	_, err = svc.Bot.Send(c.Chat(),
-		resp,
-		&tb.SendOptions{ThreadID: msg.ThreadID, ParseMode: tb.ModeMarkdown})
+		escaped,
+		&tb.SendOptions{ThreadID: msg.ThreadID, ParseMode: tb.ModeMarkdownV2})
 	if err != nil {
-		// Fallback to plain text if Markdown parsing fails
+		// Fallback to plain text if MarkdownV2 parsing still fails
 		_, err = svc.Bot.Send(c.Chat(), resp, &tb.SendOptions{ThreadID: msg.ThreadID})
 	}
 	return err
@@ -483,7 +485,7 @@ func (svc *TelegramService) onTopic(c tb.Context) error {
 
 	_, err = svc.Bot.Send(c.Chat(),
 		"Topic ready. Type anything to start",
-		&tb.SendOptions{ThreadID: topic.ThreadID, ParseMode: tb.ModeMarkdown})
+		&tb.SendOptions{ThreadID: topic.ThreadID, ParseMode: tb.ModeMarkdownV2})
 	return err
 }
 
@@ -502,7 +504,7 @@ func (svc *TelegramService) onTopicCreated(c tb.Context) error {
 
 	//_, err := svc.Bot.Send(c.Chat(),
 	//	fmt.Sprintf("Repo initialized for this topic: `%s`", repo.Path),
-	//	&tb.SendOptions{ThreadID: topic.ThreadID, ParseMode: tb.ModeMarkdown})
+	//	&tb.SendOptions{ThreadID: topic.ThreadID, ParseMode: tb.ModeMarkdownV2})
 	//return err
 	return nil
 }
@@ -1196,4 +1198,151 @@ func (svc *TelegramService) startGithubSSH(c tb.Context) error {
 	msg := fmt.Sprintf("SSH key ready. Add this public key to GitHub:\n`%s`", strings.TrimSpace(string(pubKey)))
 	_, err = svc.Bot.Send(c.Chat(), msg)
 	return err
+}
+
+// escapeMarkdownV2 converts standard Markdown text into Telegram MarkdownV2
+// safe text. It walks the input character by character, tracking context
+// (code blocks, inline code, link URLs) and applies the correct escaping
+// rules for each context per the Telegram Bot API spec.
+func escapeMarkdownV2(text string) string {
+	// Characters that must be escaped in normal text.
+	const specialChars = `_*[]()~` + "`" + `>#+-=|{}.!\`
+
+	isSpecial := func(c byte) bool {
+		return strings.IndexByte(specialChars, c) >= 0
+	}
+
+	var b strings.Builder
+	b.Grow(len(text) + len(text)/4)
+
+	i := 0
+	n := len(text)
+
+	for i < n {
+		// --- fenced code block: ```...``` ---
+		if i+2 < n && text[i] == '`' && text[i+1] == '`' && text[i+2] == '`' {
+			// Find the optional language tag (rest of the line after ```)
+			j := i + 3
+			// Skip the language identifier on the opening fence
+			for j < n && text[j] != '\n' && text[j] != '`' {
+				j++
+			}
+			// Find closing ```
+			end := strings.Index(text[j:], "```")
+			if end == -1 {
+				// No closing fence — escape the triple backtick and continue
+				b.WriteString("\\`\\`\\`")
+				i += 3
+				continue
+			}
+			end += j // absolute index of closing ```
+
+			// Write opening ```
+			b.WriteString("```")
+			// Write language tag + content, escaping only ` and \ inside
+			for k := i + 3; k < end; k++ {
+				if text[k] == '`' || text[k] == '\\' {
+					b.WriteByte('\\')
+				}
+				b.WriteByte(text[k])
+			}
+			// Write closing ```
+			b.WriteString("```")
+			i = end + 3
+			continue
+		}
+
+		// --- inline code: `...` ---
+		if text[i] == '`' {
+			end := strings.IndexByte(text[i+1:], '`')
+			if end == -1 {
+				// No closing backtick — escape and continue
+				b.WriteString("\\`")
+				i++
+				continue
+			}
+			end += i + 1 // absolute index of closing `
+
+			b.WriteByte('`')
+			// Inside code: escape only ` and \
+			for k := i + 1; k < end; k++ {
+				if text[k] == '`' || text[k] == '\\' {
+					b.WriteByte('\\')
+				}
+				b.WriteByte(text[k])
+			}
+			b.WriteByte('`')
+			i = end + 1
+			continue
+		}
+
+		// --- inline link: [text](url) ---
+		if text[i] == '[' {
+			// Look for ](
+			closeBracket := -1
+			depth := 1
+			for k := i + 1; k < n; k++ {
+				if text[k] == '[' {
+					depth++
+				} else if text[k] == ']' {
+					depth--
+					if depth == 0 {
+						closeBracket = k
+						break
+					}
+				}
+			}
+			if closeBracket != -1 && closeBracket+1 < n && text[closeBracket+1] == '(' {
+				// Find the matching closing )
+				parenStart := closeBracket + 2
+				parenDepth := 1
+				parenEnd := -1
+				for k := parenStart; k < n; k++ {
+					if text[k] == '(' && text[k-1] != '\\' {
+						parenDepth++
+					} else if text[k] == ')' {
+						parenDepth--
+						if parenDepth == 0 {
+							parenEnd = k
+							break
+						}
+					}
+				}
+				if parenEnd != -1 {
+					// Write [, escaped link text, ](, escaped URL, )
+					b.WriteByte('[')
+					for k := i + 1; k < closeBracket; k++ {
+						if isSpecial(text[k]) {
+							b.WriteByte('\\')
+						}
+						b.WriteByte(text[k])
+					}
+					b.WriteString("](")
+					// Inside (...): escape only ) and \
+					for k := parenStart; k < parenEnd; k++ {
+						if text[k] == ')' || text[k] == '\\' {
+							b.WriteByte('\\')
+						}
+						b.WriteByte(text[k])
+					}
+					b.WriteByte(')')
+					i = parenEnd + 1
+					continue
+				}
+			}
+			// Not a valid link — escape the [ and continue
+			b.WriteString("\\[")
+			i++
+			continue
+		}
+
+		// --- normal text ---
+		if isSpecial(text[i]) {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(text[i])
+		i++
+	}
+
+	return b.String()
 }
