@@ -350,7 +350,7 @@ func (svc *TelegramService) runAgentWithPendingUpdates(chat *tb.Chat, opts *tb.S
 	go func() {
 		defer close(updatesDone)
 
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 
 		for {
@@ -1184,6 +1184,7 @@ func (svc *TelegramService) restartProcess() error {
 	}
 
 	restartCommands := [][]string{
+		{"git", "pull"},
 		{"go", "mod", "tidy"},
 		{"go", "mod", "vendor"},
 		{"go", "build", "./runtime/gocode.go"},
