@@ -33,10 +33,17 @@ type TelegramService struct {
 	topicContexts     map[string]*TopicContext
 	topicContextsPath string
 	allowedUserID     int64
+	runQueueMu        sync.Mutex
+	runQueues         map[string]chan queuedRunTask
 
 	deleteTopicMarkup  *tb.ReplyMarkup
 	deleteTopicConfirm tb.Btn
 	deleteTopicCancel  tb.Btn
+}
+
+type queuedRunTask struct {
+	run  func() error
+	done chan error
 }
 
 type TopicContext struct {
@@ -72,6 +79,7 @@ func (svc *TelegramService) Configure(ctx *context.Context) (err error) {
 	}
 
 	svc.topicContexts = make(map[string]*TopicContext)
+	svc.runQueues = make(map[string]chan queuedRunTask)
 	path := strings.TrimSpace(os.Getenv("TELEGRAM_TOPIC_CONTEXTS_PATH"))
 	if path == "" {
 		path = filepath.Join("data", "telegram_topics.json")
@@ -205,7 +213,9 @@ func (svc *TelegramService) guardHandler(fn tb.HandlerFunc) tb.HandlerFunc {
 
 		if err := fn(c); err != nil {
 			svc.decorateTelegramEvent(log.Error().Err(err), c).Msg("telegram handler returned error")
-			return err
+			// Keep the bot running on transient Telegram API/network failures.
+			// Errors are logged above for diagnosis.
+			return nil
 		}
 
 		return nil
@@ -228,11 +238,8 @@ func (svc *TelegramService) decorateTelegramEvent(event *zerolog.Event, c tb.Con
 	if msg := c.Message(); msg != nil {
 		text := strings.TrimSpace(msg.Text)
 		command := ""
-		if strings.HasPrefix(text, "/") {
-			fields := strings.Fields(strings.TrimPrefix(text, "/"))
-			if len(fields) > 0 {
-				command = fields[0]
-			}
+		if parsed, _, ok := parseCommandText(text); ok {
+			command = strings.TrimPrefix(parsed, "/")
 		}
 
 		event = event.
@@ -293,6 +300,10 @@ func (svc *TelegramService) onText(c tb.Context) error {
 	}
 
 	if strings.HasPrefix(msg.Text, "/") {
+		handled, err := svc.dispatchTextCommand(c)
+		if handled {
+			return err
+		}
 		return nil
 	}
 
@@ -304,7 +315,9 @@ func (svc *TelegramService) onText(c tb.Context) error {
 			Emoji: "👍",
 		}}})
 
-		return svc.runAgentWithPendingUpdates(c.Chat(), &tb.SendOptions{}, "", c.Text())
+		return svc.runAgentSequential(c.Chat().ID, 0, func() error {
+			return svc.runAgentWithPendingUpdates(c.Chat(), &tb.SendOptions{}, "", c.Text())
+		})
 	}
 
 	log.Info().Str("text", msg.Text).Int("topic", msg.ThreadID).Msg("onText topic")
@@ -326,7 +339,69 @@ func (svc *TelegramService) onText(c tb.Context) error {
 		Emoji: "👍",
 	}}})
 
-	return svc.runAgentWithPendingUpdates(c.Chat(), &tb.SendOptions{ThreadID: msg.ThreadID}, repo.Path, c.Text())
+	return svc.runAgentSequential(c.Chat().ID, msg.ThreadID, func() error {
+		return svc.runAgentWithPendingUpdates(c.Chat(), &tb.SendOptions{ThreadID: msg.ThreadID}, repo.Path, c.Text())
+	})
+}
+
+func (svc *TelegramService) dispatchTextCommand(c tb.Context) (bool, error) {
+	msg := c.Message()
+	if msg == nil {
+		return false, nil
+	}
+
+	command, payload, ok := parseCommandText(msg.Text)
+	if !ok {
+		return false, nil
+	}
+
+	msg.Payload = payload
+
+	switch command {
+	case "/clear":
+		return true, svc.onClear(c)
+	case "/new":
+		return true, svc.onTopic(c)
+	case "/delete":
+		return true, svc.onDeleteTopic(c)
+	case "/github":
+		return true, svc.onGithub(c)
+	case "/pull":
+		return true, svc.onPull(c)
+	case "/preview":
+		return true, svc.onPreview(c)
+	case "/branch":
+		return true, svc.onBranch(c)
+	case "/commit":
+		return true, svc.onCommit(c)
+	case "/restart":
+		return true, svc.onRestart(c)
+	default:
+		return false, nil
+	}
+}
+
+func parseCommandText(text string) (command string, payload string, ok bool) {
+	trimmed := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmed, "/") {
+		return "", "", false
+	}
+
+	fields := strings.Fields(trimmed)
+	if len(fields) == 0 {
+		return "", "", false
+	}
+
+	commandToken := fields[0]
+	if atIdx := strings.Index(commandToken, "@"); atIdx >= 0 {
+		commandToken = commandToken[:atIdx]
+	}
+	if commandToken == "" || !strings.HasPrefix(commandToken, "/") {
+		return "", "", false
+	}
+
+	payload = strings.TrimSpace(strings.TrimPrefix(trimmed, fields[0]))
+	return commandToken, payload, true
 }
 
 func (svc *TelegramService) runAgentWithPendingUpdates(chat *tb.Chat, opts *tb.SendOptions, repoPath, prompt string) error {
@@ -376,7 +451,10 @@ func (svc *TelegramService) runAgentWithPendingUpdates(chat *tb.Chat, opts *tb.S
 
 	if runErr != nil {
 		log.Error().Err(runErr).Msg("failed to run agent request")
-		return svc.sendFinalResponse(chat, opts, pendingMessageID, "Agent failed to run.", "")
+		if err := svc.sendFinalResponse(chat, opts, pendingMessageID, "Agent failed to run.", ""); err != nil {
+			log.Warn().Err(err).Msg("failed to send agent failure response")
+		}
+		return nil
 	}
 
 	escaped := escapeMarkdownV2(resp)
@@ -384,7 +462,51 @@ func (svc *TelegramService) runAgentWithPendingUpdates(chat *tb.Chat, opts *tb.S
 	if sendErr != nil {
 		sendErr = svc.sendFinalResponse(chat, opts, pendingMessageID, resp, "")
 	}
-	return sendErr
+	if sendErr != nil {
+		log.Warn().Err(sendErr).Msg("failed to send final agent response")
+	}
+	return nil
+}
+
+func (svc *TelegramService) runAgentSequential(chatID int64, threadID int, run func() error) error {
+	if run == nil {
+		return errors.New("missing run task")
+	}
+
+	queue := svc.ensureRunQueue(chatID, threadID)
+	done := make(chan error, 1)
+	queue <- queuedRunTask{
+		run:  run,
+		done: done,
+	}
+
+	return <-done
+}
+
+func (svc *TelegramService) ensureRunQueue(chatID int64, threadID int) chan queuedRunTask {
+	key := topicKey(chatID, threadID)
+
+	svc.runQueueMu.Lock()
+	queue, ok := svc.runQueues[key]
+	if !ok {
+		queue = make(chan queuedRunTask, 64)
+		svc.runQueues[key] = queue
+		go svc.processRunQueue(queue)
+	}
+	svc.runQueueMu.Unlock()
+
+	return queue
+}
+
+func (svc *TelegramService) processRunQueue(queue <-chan queuedRunTask) {
+	for task := range queue {
+		var runErr error
+		if task.run != nil {
+			runErr = task.run()
+		}
+		task.done <- runErr
+		close(task.done)
+	}
 }
 
 func (svc *TelegramService) sendFinalResponse(chat *tb.Chat, baseOpts *tb.SendOptions, pendingMessageID int, text, parseMode string) error {
@@ -426,6 +548,9 @@ func (svc *TelegramService) editOrSendByMessageID(chat *tb.Chat, baseOpts *tb.Se
 			}
 			return messageID, nil
 		}
+		// Once a pending message exists, do not send a new one on edit failure.
+		// This prevents duplicate "Still thinking..." messages during transient edit errors.
+		return messageID, err
 	}
 
 	sentMsg, err := svc.Bot.Send(chat, text, opts)

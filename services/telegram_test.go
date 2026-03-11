@@ -1,6 +1,11 @@
 package services
 
-import "testing"
+import (
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 func TestEscapeMarkdownV2_PlainText(t *testing.T) {
 	got := escapeMarkdownV2("hello world")
@@ -210,5 +215,81 @@ func TestEscapeMarkdownV2_NumberedList(t *testing.T) {
 	want := "1\\. first\n2\\. second"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestParseCommandText_Basic(t *testing.T) {
+	cmd, payload, ok := parseCommandText("/clear")
+	if !ok {
+		t.Fatalf("expected command parse to succeed")
+	}
+	if cmd != "/clear" {
+		t.Fatalf("cmd = %q, want %q", cmd, "/clear")
+	}
+	if payload != "" {
+		t.Fatalf("payload = %q, want empty", payload)
+	}
+}
+
+func TestParseCommandText_WithMentionAndPayload(t *testing.T) {
+	cmd, payload, ok := parseCommandText("/new@gocode_sh_bot my-topic https://github.com/org/repo")
+	if !ok {
+		t.Fatalf("expected command parse to succeed")
+	}
+	if cmd != "/new" {
+		t.Fatalf("cmd = %q, want %q", cmd, "/new")
+	}
+	if payload != "my-topic https://github.com/org/repo" {
+		t.Fatalf("payload = %q, want %q", payload, "my-topic https://github.com/org/repo")
+	}
+}
+
+func TestParseCommandText_RejectsNonCommand(t *testing.T) {
+	if _, _, ok := parseCommandText("hello world"); ok {
+		t.Fatalf("expected parse to fail for non-command text")
+	}
+}
+
+func TestRunAgentSequential_SerializesSameThread(t *testing.T) {
+	svc := &TelegramService{
+		runQueues: make(map[string]chan queuedRunTask),
+	}
+
+	const workers = 8
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var inFlight int32
+	var maxInFlight int32
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+
+			err := svc.runAgentSequential(123, 456, func() error {
+				current := atomic.AddInt32(&inFlight, 1)
+				for {
+					seen := atomic.LoadInt32(&maxInFlight)
+					if current <= seen || atomic.CompareAndSwapInt32(&maxInFlight, seen, current) {
+						break
+					}
+				}
+
+				time.Sleep(20 * time.Millisecond)
+				atomic.AddInt32(&inFlight, -1)
+				return nil
+			})
+			if err != nil {
+				t.Errorf("runAgentSequential returned error: %v", err)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	if maxInFlight != 1 {
+		t.Fatalf("expected max in-flight tasks = 1, got %d", maxInFlight)
 	}
 }

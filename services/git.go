@@ -17,6 +17,7 @@ import (
 )
 
 const GIT_SVC = "git_svc"
+const gitCloneTimeout = 90 * time.Second
 
 type GitRepo struct {
 	ChatID        int64
@@ -582,15 +583,29 @@ func (svc *GitService) cloneRepo(repoURL, repoPath, token string) error {
 		args = append([]string{"-c", "http.extraHeader=AUTHORIZATION: basic " + encoded}, args...)
 	}
 
-	cmd := exec.CommandContext(context.Background(), "git", args...)
+	ctx, cancel := context.WithTimeout(context.Background(), gitCloneTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", args...)
+	// Avoid interactive git credential prompts that can hang the bot.
+	cmd.Env = append(os.Environ(),
+		"GIT_TERMINAL_PROMPT=0",
+		"GCM_INTERACTIVE=never",
+	)
 	if useSSH {
-		cmd.Env = append(os.Environ(),
+		cmd.Env = append(cmd.Env,
 			"GIT_SSH_COMMAND=ssh -i "+keyPath+" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
 		)
 	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("git clone timed out after %s", gitCloneTimeout)
+		}
+		return err
+	}
+	return nil
 }
 
 func (svc *GitService) isGitRepo(repoPath string) bool {
