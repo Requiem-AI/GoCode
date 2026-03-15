@@ -52,7 +52,7 @@ func (c *CodexClient) Send(ctx context.Context, req Request) (Response, error) {
 
 	var args []string
 	if shouldResume {
-		args = []string{"exec", "resume", "--last", "--", req.Message}
+		args = []string{"exec", "-s", "danger-full-access", "resume", "--last", "--", req.Message}
 	} else {
 		args = []string{"exec", "-s", "danger-full-access"}
 		if req.RepoPath != "" {
