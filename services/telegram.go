@@ -69,7 +69,7 @@ func (svc *TelegramService) Configure(ctx *context.Context) (err error) {
 			Timeout: 30 * time.Second,
 		},
 		Client: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: 60 * time.Second,
 		},
 		OnError: func(err error, c tb.Context) {
 			svc.decorateTelegramEvent(log.Error().Err(err), c).Msg("telegram bot error")
@@ -545,9 +545,18 @@ func (svc *TelegramService) processRunQueue(key string, queue <-chan func()) {
 	logger.Info().Msg("run queue processor started")
 	for task := range queue {
 		logger.Debug().Msg("run queue processing next task")
-		task()
+		svc.safeRunTask(logger, task)
 	}
 	logger.Info().Msg("run queue processor exited")
+}
+
+func (svc *TelegramService) safeRunTask(logger zerolog.Logger, task func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error().Interface("panic", r).Msg("recovered panic in run queue task")
+		}
+	}()
+	task()
 }
 
 func (svc *TelegramService) sendFinalResponse(chat *tb.Chat, baseOpts *tb.SendOptions, pendingMessageID int, text, parseMode string) error {
