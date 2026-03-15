@@ -2,7 +2,6 @@ package services
 
 import (
 	"errors"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -251,44 +250,39 @@ func TestParseCommandText_RejectsNonCommand(t *testing.T) {
 	}
 }
 
-func TestRunAgentSequential_SerializesSameThread(t *testing.T) {
+func TestProcessRunQueue_SerializesTasks(t *testing.T) {
 	svc := &TelegramService{
-		runQueues: make(map[string]chan queuedRunTask),
+		runQueues: make(map[string]chan func()),
 	}
 
-	const workers = 8
-	start := make(chan struct{})
-	var wg sync.WaitGroup
+	const tasks = 8
+	queue := make(chan func(), 64)
+	svc.runQueues["test"] = queue
+	go svc.processRunQueue("test", queue)
+
 	var inFlight int32
 	var maxInFlight int32
+	done := make(chan struct{}, tasks)
 
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-
-			err := svc.runAgentSequential(123, 456, func() error {
-				current := atomic.AddInt32(&inFlight, 1)
-				for {
-					seen := atomic.LoadInt32(&maxInFlight)
-					if current <= seen || atomic.CompareAndSwapInt32(&maxInFlight, seen, current) {
-						break
-					}
+	for i := 0; i < tasks; i++ {
+		queue <- func() {
+			current := atomic.AddInt32(&inFlight, 1)
+			for {
+				seen := atomic.LoadInt32(&maxInFlight)
+				if current <= seen || atomic.CompareAndSwapInt32(&maxInFlight, seen, current) {
+					break
 				}
-
-				time.Sleep(20 * time.Millisecond)
-				atomic.AddInt32(&inFlight, -1)
-				return nil
-			})
-			if err != nil {
-				t.Errorf("runAgentSequential returned error: %v", err)
 			}
-		}()
+
+			time.Sleep(20 * time.Millisecond)
+			atomic.AddInt32(&inFlight, -1)
+			done <- struct{}{}
+		}
 	}
 
-	close(start)
-	wg.Wait()
+	for i := 0; i < tasks; i++ {
+		<-done
+	}
 
 	if maxInFlight != 1 {
 		t.Fatalf("expected max in-flight tasks = 1, got %d", maxInFlight)
