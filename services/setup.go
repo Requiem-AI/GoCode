@@ -112,7 +112,7 @@ func (svc *SetupService) runTelegramSetup() error {
 	fmt.Fprintln(os.Stdout, "")
 	fmt.Fprintln(os.Stdout, "BotFather tips:")
 	fmt.Fprintln(os.Stdout, "- Create a bot with /newbot, then copy the token.")
-	fmt.Fprintln(os.Stdout, "- No webhook needed; this service uses long polling.")
+	fmt.Fprintln(os.Stdout, "- This service uses webhooks. Set TELEGRAM_PORT for the webhook listener.")
 	fmt.Fprintln(os.Stdout, "")
 
 	secret, err := promptRequired(reader, "Bot token (from BotFather /newbot)", current.TelegramSecret)

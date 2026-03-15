@@ -36,6 +36,8 @@ type TelegramService struct {
 	topicContexts     map[string]*TopicContext
 	topicContextsPath string
 	allowedUserID     int64
+	port              int
+	pingServer        *http.Server
 	runQueueMu        sync.Mutex
 	runQueues         map[string]chan func()
 
@@ -63,10 +65,24 @@ func (svc *TelegramService) Configure(ctx *context.Context) (err error) {
 	}
 	svc.allowedUserID = allowedUserID
 
+	port, err := strconv.Atoi(os.Getenv("TELEGRAM_PORT"))
+	if err != nil {
+		return fmt.Errorf("invalid TELEGRAM_PORT %w", err)
+	}
+	svc.port = port
+	if svc.port == 0 {
+		return fmt.Errorf("TELEGRAM_PORT is required for webhook mode")
+	}
+
+	webhookURL := fmt.Sprintf("%s:%d", os.Getenv("TELEGRAM_WEBHOOK"), svc.port)
+
 	svc.Bot, err = tb.NewBot(tb.Settings{
 		Token: os.Getenv("TELEGRAM_SECRET"),
-		Poller: &tb.LongPoller{
-			Timeout: 30 * time.Second,
+		Poller: &tb.Webhook{
+			Listen: fmt.Sprintf(":%d", svc.port),
+			Endpoint: &tb.WebhookEndpoint{
+				PublicURL: webhookURL,
+			},
 		},
 		Client: &http.Client{
 			Timeout: 60 * time.Second,
@@ -107,16 +123,22 @@ func (svc *TelegramService) Start() error {
 	svc.setupHandlers()
 	svc.setupEvents()
 	svc.sendOnlineMessage()
+	svc.startPingServer()
 
-	log.Info().Msg("telegram bot polling started")
+	log.Info().Int("port", svc.port).Msg("telegram bot webhook started")
 	svc.Bot.Start()
 
-	log.Info().Msg("telegram bot polling stopped")
+	log.Info().Msg("telegram bot webhook stopped")
 	return nil
 }
 
 func (svc *TelegramService) Shutdown() {
 	log.Info().Msg("telegram service shutting down")
+	if svc.pingServer != nil {
+		if err := svc.pingServer.Close(); err != nil {
+			log.Error().Err(err).Msg("ping server shutdown error")
+		}
+	}
 	if svc.Bot == nil {
 		log.Warn().Msg("telegram shutdown: bot is nil")
 		return
@@ -298,6 +320,32 @@ func (svc *TelegramService) parseAllowedUserID() (int64, error) {
 		return 0, fmt.Errorf("invalid USER_ID %q: %w", raw, err)
 	}
 	return value, nil
+}
+
+func (svc *TelegramService) startPingServer() {
+	if svc.port == 0 {
+		log.Warn().Msg("TELEGRAM_PORT not set, skipping ping server")
+		return
+	}
+
+	pingPort := svc.port + 1
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("pong"))
+	})
+
+	svc.pingServer = &http.Server{
+		Addr:    fmt.Sprintf(":%d", pingPort),
+		Handler: mux,
+	}
+
+	go func() {
+		log.Info().Int("port", pingPort).Msg("ping server starting")
+		if err := svc.pingServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error().Err(err).Msg("ping server error")
+		}
+	}()
 }
 
 func (svc *TelegramService) onText(c tb.Context) error {
