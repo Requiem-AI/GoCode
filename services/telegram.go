@@ -74,14 +74,12 @@ func (svc *TelegramService) Configure(ctx *context.Context) (err error) {
 		return fmt.Errorf("TELEGRAM_PORT is required for webhook mode")
 	}
 
-	webhookURL := fmt.Sprintf("%s:%d", os.Getenv("TELEGRAM_WEBHOOK"), svc.port)
-
 	svc.Bot, err = tb.NewBot(tb.Settings{
 		Token: os.Getenv("TELEGRAM_SECRET"),
 		Poller: &tb.Webhook{
 			Listen: fmt.Sprintf(":%d", svc.port),
 			Endpoint: &tb.WebhookEndpoint{
-				PublicURL: webhookURL,
+				PublicURL: os.Getenv("TELEGRAM_WEBHOOK"),
 			},
 		},
 		Client: &http.Client{
