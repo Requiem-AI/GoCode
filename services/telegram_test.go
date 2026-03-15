@@ -1,6 +1,7 @@
 package services
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -291,5 +292,35 @@ func TestRunAgentSequential_SerializesSameThread(t *testing.T) {
 
 	if maxInFlight != 1 {
 		t.Fatalf("expected max in-flight tasks = 1, got %d", maxInFlight)
+	}
+}
+
+type testNetError struct {
+	timeout   bool
+	temporary bool
+}
+
+func (e testNetError) Error() string   { return "network error" }
+func (e testNetError) Timeout() bool   { return e.timeout }
+func (e testNetError) Temporary() bool { return e.temporary }
+
+func TestIsRetryableTelegramSendError_NetworkTimeout(t *testing.T) {
+	err := testNetError{timeout: true}
+	if !isRetryableTelegramSendError(err) {
+		t.Fatalf("expected network timeout to be retryable")
+	}
+}
+
+func TestIsRetryableTelegramSendError_TooManyRequests(t *testing.T) {
+	err := errors.New("telegram: Too Many Requests: retry after 1")
+	if !isRetryableTelegramSendError(err) {
+		t.Fatalf("expected 429 to be retryable")
+	}
+}
+
+func TestIsRetryableTelegramSendError_ParseEntities(t *testing.T) {
+	err := errors.New("telegram: Bad Request: can't parse entities: Character '.' is reserved and must be escaped")
+	if isRetryableTelegramSendError(err) {
+		t.Fatalf("expected parse entities error to be non-retryable")
 	}
 }

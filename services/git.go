@@ -18,6 +18,7 @@ import (
 
 const GIT_SVC = "git_svc"
 const gitCloneTimeout = 90 * time.Second
+const gitCommandTimeout = 2 * time.Minute
 
 type GitRepo struct {
 	ChatID        int64
@@ -726,16 +727,39 @@ func (svc *GitService) branchExists(repoPath, branch string) bool {
 }
 
 func (svc *GitService) runGit(repoPath string, args ...string) error {
-	cmd := exec.CommandContext(context.Background(), "git", append([]string{"-C", repoPath}, args...)...)
+	ctx, cancel := context.WithTimeout(context.Background(), gitCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", repoPath}, args...)...)
+	cmd.Env = append(os.Environ(),
+		"GIT_TERMINAL_PROMPT=0",
+		"GCM_INTERACTIVE=never",
+	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("git command timed out after %s", gitCommandTimeout)
+		}
+		return err
+	}
+	return nil
 }
 
 func (svc *GitService) runGitOutput(repoPath string, args ...string) (string, error) {
-	cmd := exec.CommandContext(context.Background(), "git", append([]string{"-C", repoPath}, args...)...)
+	ctx, cancel := context.WithTimeout(context.Background(), gitCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", repoPath}, args...)...)
+	cmd.Env = append(os.Environ(),
+		"GIT_TERMINAL_PROMPT=0",
+		"GCM_INTERACTIVE=never",
+	)
 	output, err := cmd.Output()
 	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return "", fmt.Errorf("git command timed out after %s", gitCommandTimeout)
+		}
 		return "", err
 	}
 	return strings.TrimSpace(string(output)), nil

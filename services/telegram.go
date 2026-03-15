@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -11,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -69,6 +72,9 @@ func (svc *TelegramService) Configure(ctx *context.Context) (err error) {
 		Token: os.Getenv("TELEGRAM_SECRET"),
 		Poller: &tb.LongPoller{
 			Timeout: 30 * time.Second,
+		},
+		Client: &http.Client{
+			Timeout: 20 * time.Second,
 		},
 		OnError: func(err error, c tb.Context) {
 			svc.decorateTelegramEvent(log.Error().Err(err), c).Msg("telegram bot error")
@@ -162,7 +168,7 @@ func (svc *TelegramService) sendOnlineMessage() {
 		message = "Bot is online."
 	}
 
-	_, err := svc.Bot.Send(&tb.Chat{ID: chatID}, message)
+	_, err := svc.sendWithRetry(&tb.Chat{ID: chatID}, message, nil)
 	if err != nil {
 		log.Error().Err(err).Int64("chat_id", chatID).Msg("failed to send online message")
 		return
@@ -416,7 +422,7 @@ func (svc *TelegramService) runAgentWithPendingUpdates(chat *tb.Chat, opts *tb.S
 	}
 
 	started := time.Now()
-	pendingMessageID := 0
+	var pendingMessageID atomic.Int64
 	pendingOpts := cloneSendOptions(opts)
 	pendingOpts.DisableNotification = true
 
@@ -435,32 +441,37 @@ func (svc *TelegramService) runAgentWithPendingUpdates(chat *tb.Chat, opts *tb.S
 			case <-ticker.C:
 				elapsed := int(time.Since(started).Seconds())
 				updateText := fmt.Sprintf("Still thinking... (%ds elapsed)", elapsed)
-				nextMessageID, updateErr := svc.editOrSendByMessageID(chat, pendingOpts, pendingMessageID, updateText, "")
+				currentPendingMessageID := int(pendingMessageID.Load())
+				nextMessageID, updateErr := svc.editOrSendByMessageID(chat, pendingOpts, currentPendingMessageID, updateText, "")
 				if updateErr != nil {
 					log.Warn().Err(updateErr).Msg("failed to update pending message")
 					continue
 				}
-				pendingMessageID = nextMessageID
+				pendingMessageID.Store(int64(nextMessageID))
 			}
 		}
 	}()
 
 	resp, runErr := svc.agent.Run(repoPath, prompt)
 	close(stopUpdates)
-	<-updatesDone
+	select {
+	case <-updatesDone:
+	case <-time.After(2 * time.Second):
+		log.Warn().Msg("timed out waiting for pending updates loop to stop")
+	}
 
 	if runErr != nil {
 		log.Error().Err(runErr).Msg("failed to run agent request")
-		if err := svc.sendFinalResponse(chat, opts, pendingMessageID, "Agent failed to run.", ""); err != nil {
+		if err := svc.sendFinalResponse(chat, opts, int(pendingMessageID.Load()), "Agent failed to run.", ""); err != nil {
 			log.Warn().Err(err).Msg("failed to send agent failure response")
 		}
 		return nil
 	}
 
 	escaped := escapeMarkdownV2(resp)
-	sendErr := svc.sendFinalResponse(chat, opts, pendingMessageID, escaped, tb.ModeMarkdownV2)
+	sendErr := svc.sendFinalResponse(chat, opts, int(pendingMessageID.Load()), escaped, tb.ModeMarkdownV2)
 	if sendErr != nil {
-		sendErr = svc.sendFinalResponse(chat, opts, pendingMessageID, resp, "")
+		sendErr = svc.sendFinalResponse(chat, opts, int(pendingMessageID.Load()), resp, "")
 	}
 	if sendErr != nil {
 		log.Warn().Err(sendErr).Msg("failed to send final agent response")
@@ -526,7 +537,7 @@ func (svc *TelegramService) sendFinalResponse(chat *tb.Chat, baseOpts *tb.SendOp
 		opts.ParseMode = parseMode
 	}
 
-	_, err := svc.Bot.Send(chat, text, opts)
+	_, err := svc.sendWithRetry(chat, text, opts)
 	return err
 }
 
@@ -568,6 +579,49 @@ func cloneSendOptions(opts *tb.SendOptions) *tb.SendOptions {
 	return &copy
 }
 
+func (svc *TelegramService) sendWithRetry(chat *tb.Chat, text string, opts *tb.SendOptions) (*tb.Message, error) {
+	const maxAttempts = 3
+	backoff := 250 * time.Millisecond
+	var msg *tb.Message
+	var err error
+
+	if opts == nil {
+		opts = &tb.SendOptions{}
+	}
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		msg, err = svc.Bot.Send(chat, text, opts)
+		if err == nil || !isRetryableTelegramSendError(err) || attempt == maxAttempts {
+			return msg, err
+		}
+		time.Sleep(backoff)
+		backoff *= 2
+	}
+
+	return msg, err
+}
+
+func isRetryableTelegramSendError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "operation timed out") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "too many requests") ||
+		strings.Contains(msg, "retry after") ||
+		strings.Contains(msg, "internal server error") ||
+		strings.Contains(msg, "bad gateway") ||
+		strings.Contains(msg, "service unavailable") ||
+		strings.Contains(msg, "gateway timeout")
+}
+
 func (svc *TelegramService) onClear(c tb.Context) error {
 	msg := c.Message()
 	if msg == nil || !msg.TopicMessage || msg.ThreadID == 0 {
@@ -587,7 +641,7 @@ func (svc *TelegramService) onClear(c tb.Context) error {
 		return c.Send("Failed to clear the context.", &tb.SendOptions{ThreadID: msg.ThreadID})
 	}
 
-	_, err = svc.Bot.Send(c.Chat(), "Context cleared.", &tb.SendOptions{ThreadID: msg.ThreadID})
+	_, err = svc.sendWithRetry(c.Chat(), "Context cleared.", &tb.SendOptions{ThreadID: msg.ThreadID})
 	return err
 }
 
@@ -597,7 +651,7 @@ func (svc *TelegramService) onDeleteTopic(c tb.Context) error {
 		return c.Send("Use /delete inside the topic you want to remove.")
 	}
 
-	_, err := svc.Bot.Send(c.Chat(),
+	_, err := svc.sendWithRetry(c.Chat(),
 		"This will delete the topic and its repository. Are you sure?",
 		&tb.SendOptions{ThreadID: msg.ThreadID, ReplyMarkup: svc.deleteTopicMarkup})
 	return err
@@ -690,8 +744,9 @@ func (svc *TelegramService) onTopic(c tb.Context) error {
 		})
 	}
 
-	_, err = svc.Bot.Send(c.Chat(),
-		"Topic ready. Type anything to start",
+	readyMsg := escapeMarkdownV2("Topic ready. Type anything to start")
+	_, err = svc.sendWithRetry(c.Chat(),
+		readyMsg,
 		&tb.SendOptions{ThreadID: topic.ThreadID, ParseMode: tb.ModeMarkdownV2})
 	return err
 }
@@ -1268,14 +1323,22 @@ func (svc *TelegramService) onCommit(c tb.Context) error {
 		return c.Send("Couldn't prepare the repo for this topic.", &tb.SendOptions{ThreadID: msg.ThreadID})
 	}
 
+	pendingID := 0
+	pendingOpts := &tb.SendOptions{ThreadID: msg.ThreadID, DisableNotification: true}
+	pendingID, err = svc.editOrSendByMessageID(c.Chat(), pendingOpts, pendingID, "Running commit flow...", "")
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to send commit status message")
+		pendingID = 0
+	}
+
 	result, err := svc.commitAndOpenPR(repo, msg.Payload)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to commit and open pr")
-		return c.Send(fmt.Sprintf("Commit flow failed: %s", err.Error()), &tb.SendOptions{ThreadID: msg.ThreadID})
+		return svc.sendFinalResponse(c.Chat(), &tb.SendOptions{ThreadID: msg.ThreadID}, pendingID, fmt.Sprintf("Commit flow failed: %s", err.Error()), "")
 	}
 
 	resp := fmt.Sprintf("Committed and pushed to %s\nMessage: %s\nPR: %s", result.Branch, result.CommitMessage, result.PRURL)
-	return c.Send(resp, &tb.SendOptions{ThreadID: msg.ThreadID})
+	return svc.sendFinalResponse(c.Chat(), &tb.SendOptions{ThreadID: msg.ThreadID}, pendingID, resp, "")
 }
 
 func (svc *TelegramService) onRestart(c tb.Context) error {
@@ -1388,7 +1451,7 @@ func (svc *TelegramService) startGithubSSH(c tb.Context) error {
 	}
 
 	msg := fmt.Sprintf("SSH key ready. Add this public key to GitHub:\n`%s`", strings.TrimSpace(string(pubKey)))
-	_, err = svc.Bot.Send(c.Chat(), msg)
+	_, err = svc.sendWithRetry(c.Chat(), msg, nil)
 	return err
 }
 
