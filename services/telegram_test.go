@@ -2,6 +2,7 @@ package services
 
 import (
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -316,5 +317,76 @@ func TestIsRetryableTelegramSendError_ParseEntities(t *testing.T) {
 	err := errors.New("telegram: Bad Request: can't parse entities: Character '.' is reserved and must be escaped")
 	if isRetryableTelegramSendError(err) {
 		t.Fatalf("expected parse entities error to be non-retryable")
+	}
+}
+
+func TestSplitMessage_Short(t *testing.T) {
+	chunks := splitMessage("hello", 4096)
+	if len(chunks) != 1 || chunks[0] != "hello" {
+		t.Fatalf("expected single chunk, got %d: %v", len(chunks), chunks)
+	}
+}
+
+func TestSplitMessage_ExactLimit(t *testing.T) {
+	text := strings.Repeat("a", 4096)
+	chunks := splitMessage(text, 4096)
+	if len(chunks) != 1 {
+		t.Fatalf("expected 1 chunk, got %d", len(chunks))
+	}
+}
+
+func TestSplitMessage_SplitsAtNewline(t *testing.T) {
+	line := strings.Repeat("a", 2000)
+	text := line + "\n" + line + "\n" + line
+	chunks := splitMessage(text, 4096)
+	if len(chunks) != 2 {
+		t.Fatalf("expected 2 chunks, got %d", len(chunks))
+	}
+	if chunks[0] != line+"\n"+line {
+		t.Errorf("chunk[0] unexpected: len=%d", len(chunks[0]))
+	}
+	if chunks[1] != line {
+		t.Errorf("chunk[1] unexpected: len=%d", len(chunks[1]))
+	}
+}
+
+func TestSplitMessage_SplitsAtSpace(t *testing.T) {
+	// One long line with spaces
+	word := strings.Repeat("a", 100)
+	var parts []string
+	for i := 0; i < 50; i++ {
+		parts = append(parts, word)
+	}
+	text := strings.Join(parts, " ") // 50*100 + 49 spaces = 5049
+	chunks := splitMessage(text, 4096)
+	if len(chunks) < 2 {
+		t.Fatalf("expected at least 2 chunks, got %d", len(chunks))
+	}
+	for i, c := range chunks {
+		if len(c) > 4096 {
+			t.Errorf("chunk[%d] exceeds limit: len=%d", i, len(c))
+		}
+	}
+}
+
+func TestSplitMessage_HardSplit(t *testing.T) {
+	// No spaces or newlines
+	text := strings.Repeat("a", 5000)
+	chunks := splitMessage(text, 4096)
+	if len(chunks) != 2 {
+		t.Fatalf("expected 2 chunks, got %d", len(chunks))
+	}
+	if len(chunks[0]) != 4096 {
+		t.Errorf("chunk[0] len = %d, want 4096", len(chunks[0]))
+	}
+	if len(chunks[1]) != 904 {
+		t.Errorf("chunk[1] len = %d, want 904", len(chunks[1]))
+	}
+}
+
+func TestSplitMessage_Empty(t *testing.T) {
+	chunks := splitMessage("", 4096)
+	if len(chunks) != 1 || chunks[0] != "" {
+		t.Fatalf("expected single empty chunk, got %d: %v", len(chunks), chunks)
 	}
 }

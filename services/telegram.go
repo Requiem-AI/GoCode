@@ -624,11 +624,59 @@ func (svc *TelegramService) sendFinalResponse(chat *tb.Chat, baseOpts *tb.SendOp
 		opts.ParseMode = parseMode
 	}
 
-	_, err := svc.sendWithRetry(chat, text, opts)
-	if err != nil {
-		log.Warn().Err(err).Str("parse_mode", parseMode).Msg("sendFinalResponse: sendWithRetry failed")
+	chunks := splitMessage(text, telegramMaxMessageLength)
+	log.Debug().Int("chunks", len(chunks)).Msg("sendFinalResponse: split message")
+
+	for i, chunk := range chunks {
+		_, err := svc.sendWithRetry(chat, chunk, opts)
+		if err != nil {
+			log.Warn().Err(err).Str("parse_mode", parseMode).Int("chunk", i+1).Int("total_chunks", len(chunks)).Msg("sendFinalResponse: sendWithRetry failed")
+			return err
+		}
 	}
-	return err
+	return nil
+}
+
+const telegramMaxMessageLength = 4096
+
+// splitMessage splits text into chunks that fit within maxLen.
+// It prefers splitting at newline boundaries. If a single line exceeds maxLen,
+// it splits at the last space before the limit, or hard-splits as a last resort.
+func splitMessage(text string, maxLen int) []string {
+	if len(text) <= maxLen {
+		return []string{text}
+	}
+
+	var chunks []string
+	for len(text) > 0 {
+		if len(text) <= maxLen {
+			chunks = append(chunks, text)
+			break
+		}
+
+		// Find the best split point within maxLen.
+		chunk := text[:maxLen]
+
+		// Try to split at the last newline.
+		if idx := strings.LastIndex(chunk, "\n"); idx > 0 {
+			chunks = append(chunks, text[:idx])
+			text = text[idx+1:] // skip the newline
+			continue
+		}
+
+		// No newline found; try the last space.
+		if idx := strings.LastIndex(chunk, " "); idx > 0 {
+			chunks = append(chunks, text[:idx])
+			text = text[idx+1:] // skip the space
+			continue
+		}
+
+		// No good break point; hard split.
+		chunks = append(chunks, chunk)
+		text = text[maxLen:]
+	}
+
+	return chunks
 }
 
 func (svc *TelegramService) editOrSendByMessageID(chat *tb.Chat, baseOpts *tb.SendOptions, messageID int, text, parseMode string) (int, error) {
