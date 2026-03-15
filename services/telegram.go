@@ -316,35 +316,49 @@ func (svc *TelegramService) onText(c tb.Context) error {
 		return nil
 	}
 
+	// Capture everything we need from the telebot context — the context must
+	// not be used after the handler returns because telebot may recycle it.
+	chat := c.Chat()
+	text := c.Text()
 	threadID := 0
-	repoPath := ""
+	msgRef := c.Message()
 	opts := &tb.SendOptions{}
 
 	if msg.TopicMessage && msg.ThreadID != 0 {
 		threadID = msg.ThreadID
 		opts.ThreadID = threadID
-		log.Info().Str("text", msg.Text).Int("topic", threadID).Msg("onText topic")
-
-		repo, err := svc.ensureRepo(c.Chat(), threadID)
-		if err != nil {
-			log.Error().Err(err).Int("topic", threadID).Msg("onText: failed to ensure repo")
-			return c.Send("Couldn't prepare the repo for this topic.")
-		}
-		repoPath = repo.Path
+		log.Info().Str("text", text).Int("topic", threadID).Msg("onText topic")
 	} else {
-		log.Info().Str("text", msg.Text).Msg("onText main chat")
+		log.Info().Str("text", text).Msg("onText main chat")
 	}
 
-	if err := svc.Bot.React(c.Chat(), c.Message(), tb.ReactionOptions{Reactions: []tb.Reaction{{
-		Type:  "emoji",
-		Emoji: "👍",
-	}}}); err != nil {
-		log.Warn().Err(err).Msg("onText: failed to react")
-	}
+	// Enqueue all blocking work (react, ensureRepo, agent run) so the
+	// telebot polling loop is never held up.
+	svc.enqueueWork(chat, threadID, func() {
+		logger := log.With().Int64("chat_id", chat.ID).Int("thread_id", threadID).Logger()
 
-	chat := c.Chat()
-	text := c.Text()
-	svc.enqueueAgentRun(chat, threadID, opts, repoPath, text)
+		if err := svc.Bot.React(chat, msgRef, tb.ReactionOptions{Reactions: []tb.Reaction{{
+			Type:  "emoji",
+			Emoji: "👍",
+		}}}); err != nil {
+			logger.Warn().Err(err).Msg("onText: failed to react")
+		}
+
+		repoPath := ""
+		if threadID != 0 {
+			repo, err := svc.ensureRepo(chat, threadID)
+			if err != nil {
+				logger.Error().Err(err).Msg("onText: failed to ensure repo")
+				if _, sendErr := svc.sendWithRetry(chat, "Couldn't prepare the repo for this topic.", opts); sendErr != nil {
+					logger.Warn().Err(sendErr).Msg("onText: failed to send repo error")
+				}
+				return
+			}
+			repoPath = repo.Path
+		}
+
+		svc.runAgentWithPendingUpdates(chat, opts, repoPath, text)
+	})
 	return nil
 }
 
@@ -495,9 +509,9 @@ func (svc *TelegramService) runAgentWithPendingUpdates(chat *tb.Chat, opts *tb.S
 	}
 }
 
-// enqueueAgentRun submits an agent run without blocking the telebot handler.
-// Runs for the same chat+thread are serialized via a per-topic queue.
-func (svc *TelegramService) enqueueAgentRun(chat *tb.Chat, threadID int, opts *tb.SendOptions, repoPath, prompt string) {
+// enqueueWork submits a function to run without blocking the telebot handler.
+// Work for the same chat+thread is serialized via a per-topic queue.
+func (svc *TelegramService) enqueueWork(chat *tb.Chat, threadID int, work func()) {
 	key := topicKey(chat.ID, threadID)
 	logger := log.With().Str("queue_key", key).Logger()
 
@@ -512,14 +526,14 @@ func (svc *TelegramService) enqueueAgentRun(chat *tb.Chat, threadID int, opts *t
 	svc.runQueueMu.Unlock()
 
 	select {
-	case queue <- func() {
-		logger.Info().Str("prompt", prompt).Msg("agent run starting")
-		svc.runAgentWithPendingUpdates(chat, opts, repoPath, prompt)
-		logger.Info().Msg("agent run finished")
-	}:
-		logger.Debug().Msg("agent run enqueued")
+	case queue <- work:
+		logger.Debug().Msg("work enqueued")
 	default:
-		logger.Error().Msg("agent run queue full, dropping request")
+		logger.Error().Msg("run queue full, dropping request")
+		opts := &tb.SendOptions{}
+		if threadID != 0 {
+			opts.ThreadID = threadID
+		}
 		if _, err := svc.sendWithRetry(chat, "Too many pending requests, try again shortly.", opts); err != nil {
 			logger.Warn().Err(err).Msg("failed to send queue-full message")
 		}
