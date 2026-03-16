@@ -22,6 +22,8 @@ type CodexClient struct {
 
 const CodexID = "codex"
 
+const attachmentPromptPreamble = "Telegram integration note: if you want to return a local file as an attachment, include a standalone file URI in your final response using the format file://path/to/file (repo-relative paths preferred). Only reference files that already exist."
+
 func NewCodexClient() *CodexClient {
 	bin := os.Getenv("CODEX_BIN")
 	if bin == "" {
@@ -49,16 +51,17 @@ func (c *CodexClient) Send(ctx context.Context, req Request) (Response, error) {
 	}
 
 	shouldResume := c.shouldResume(repoPath)
+	prompt := buildCodexPrompt(req.Message)
 
 	var args []string
 	if shouldResume {
-		args = []string{"exec", "-s", "danger-full-access", "resume", "--last", "--", req.Message}
+		args = []string{"exec", "-s", "danger-full-access", "resume", "--last", "--", prompt}
 	} else {
 		args = []string{"exec", "-s", "danger-full-access"}
 		if req.RepoPath != "" {
 			args = append(args, "--cd", req.RepoPath)
 		}
-		args = append(args, "--", req.Message)
+		args = append(args, "--", prompt)
 	}
 
 	out, err := c.run(ctx, repoPath, args...)
@@ -130,4 +133,13 @@ func (c *CodexClient) markSession(repoPath string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.sessions[repoPath] = true
+}
+
+func buildCodexPrompt(message string) string {
+	trimmed := strings.TrimSpace(message)
+	if trimmed == "" {
+		return attachmentPromptPreamble
+	}
+
+	return attachmentPromptPreamble + "\n\nUser request:\n" + trimmed
 }

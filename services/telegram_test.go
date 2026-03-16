@@ -2,6 +2,7 @@ package services
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -416,5 +417,48 @@ func TestSplitMessage_Empty(t *testing.T) {
 	chunks := splitMessage("", 4096)
 	if len(chunks) != 1 || chunks[0] != "" {
 		t.Fatalf("expected single empty chunk, got %d: %v", len(chunks), chunks)
+	}
+}
+
+func TestDetectFileURIs_Basic(t *testing.T) {
+	text := "Created output file://reports/summary.txt and file:///tmp/build.log"
+	files := detectFileURIs(text)
+	if len(files) != 2 {
+		t.Fatalf("expected 2 detected file URIs, got %d", len(files))
+	}
+	if files[0].Raw != "file://reports/summary.txt" || files[0].Path != "reports/summary.txt" {
+		t.Fatalf("unexpected first file: %+v", files[0])
+	}
+	if files[1].Raw != "file:///tmp/build.log" || files[1].Path != "/tmp/build.log" {
+		t.Fatalf("unexpected second file: %+v", files[1])
+	}
+}
+
+func TestDetectFileURIs_DeduplicatesAndTrims(t *testing.T) {
+	text := "Use [artifact](file://out/app.tar.gz). Also file://out/app.tar.gz!"
+	files := detectFileURIs(text)
+	if len(files) != 1 {
+		t.Fatalf("expected 1 detected file URI, got %d", len(files))
+	}
+	if files[0].Raw != "file://out/app.tar.gz" {
+		t.Fatalf("unexpected raw URI: %q", files[0].Raw)
+	}
+}
+
+func TestResolveFilePath_RepoRelative(t *testing.T) {
+	repo := t.TempDir()
+	path, err := resolveFilePath(repo, "build/output.txt")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if !strings.HasPrefix(path, repo+string(os.PathSeparator)) {
+		t.Fatalf("expected resolved path inside repo, got %q", path)
+	}
+}
+
+func TestResolveFilePath_RejectsOutsideRepo(t *testing.T) {
+	repo := t.TempDir()
+	if _, err := resolveFilePath(repo, "../secrets.txt"); err == nil {
+		t.Fatalf("expected outside-repo path to be rejected")
 	}
 }
