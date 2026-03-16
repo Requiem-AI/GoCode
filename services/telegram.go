@@ -150,6 +150,7 @@ func (svc *TelegramService) setupHandlers() {
 	svc.Bot.Handle("/new", svc.guardHandler(svc.onTopic))
 	svc.Bot.Handle("/delete", svc.guardHandler(svc.onDeleteTopic))
 	svc.Bot.Handle("/github", svc.guardHandler(svc.onGithub))
+	svc.Bot.Handle("/git", svc.guardHandler(svc.onGit))
 	svc.Bot.Handle("/pull", svc.guardHandler(svc.onPull))
 	svc.Bot.Handle("/preview", svc.guardHandler(svc.onPreview))
 	svc.Bot.Handle("/branch", svc.guardHandler(svc.onBranch))
@@ -431,6 +432,8 @@ func (svc *TelegramService) dispatchTextCommand(c tb.Context) (bool, error) {
 		return true, svc.onDeleteTopic(c)
 	case "/github":
 		return true, svc.onGithub(c)
+	case "/git":
+		return true, svc.onGit(c)
 	case "/pull":
 		return true, svc.onPull(c)
 	case "/preview":
@@ -1459,6 +1462,51 @@ func (svc *TelegramService) onPull(c tb.Context) error {
 	return c.Send("Pulled latest changes on main.", &tb.SendOptions{ThreadID: msg.ThreadID})
 }
 
+func (svc *TelegramService) onGit(c tb.Context) error {
+	msg := c.Message()
+	if msg == nil {
+		log.Warn().Msg("onGit: nil message")
+		return nil
+	}
+	if !msg.TopicMessage || msg.ThreadID == 0 {
+		return c.Send("Use /git inside a topic.")
+	}
+
+	args := strings.Fields(strings.TrimSpace(msg.Payload))
+	if len(args) == 0 {
+		return c.Send("Usage: /git <args...>\nExample: /git status", &tb.SendOptions{ThreadID: msg.ThreadID})
+	}
+
+	repo, err := svc.ensureRepo(c.Chat(), msg.ThreadID)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to ensure repo for git command")
+		return c.Send("Couldn't prepare the repo for this topic.", &tb.SendOptions{ThreadID: msg.ThreadID})
+	}
+
+	output, runErr := svc.git.RunTopicGitCommand(repo, args...)
+	commandLine := "git " + strings.Join(args, " ")
+
+	if runErr != nil {
+		log.Error().
+			Err(runErr).
+			Str("repo_path", repo.Path).
+			Str("git_args", strings.Join(args, " ")).
+			Msg("git command failed")
+
+		resp := fmt.Sprintf("Command failed: %s\nError: %s", commandLine, runErr.Error())
+		if strings.TrimSpace(output) != "" {
+			resp += "\n\n" + truncateTelegramText(output)
+		}
+		return c.Send(resp, &tb.SendOptions{ThreadID: msg.ThreadID})
+	}
+
+	if strings.TrimSpace(output) == "" {
+		return c.Send(fmt.Sprintf("Command succeeded: %s\n(no output)", commandLine), &tb.SendOptions{ThreadID: msg.ThreadID})
+	}
+
+	return c.Send(truncateTelegramText(output), &tb.SendOptions{ThreadID: msg.ThreadID})
+}
+
 func (svc *TelegramService) onCommit(c tb.Context) error {
 	msg := c.Message()
 	if msg == nil {
@@ -1491,6 +1539,17 @@ func (svc *TelegramService) onCommit(c tb.Context) error {
 
 	resp := fmt.Sprintf("Committed and pushed to %s\nMessage: %s\nPR: %s", result.Branch, result.CommitMessage, result.PRURL)
 	return svc.sendFinalResponse(c.Chat(), &tb.SendOptions{ThreadID: msg.ThreadID}, pendingID, resp, "")
+}
+
+func truncateTelegramText(text string) string {
+	const maxLen = 3900
+
+	trimmed := strings.TrimSpace(text)
+	if len(trimmed) <= maxLen {
+		return trimmed
+	}
+
+	return strings.TrimSpace(trimmed[:maxLen]) + "\n\n[output truncated]"
 }
 
 func (svc *TelegramService) onRestart(c tb.Context) error {
