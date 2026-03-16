@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -105,8 +104,10 @@ func (c *CodexClient) run(ctx context.Context, repoPath string, args ...string) 
 	cmdline := strings.TrimSpace(strings.Join(append([]string{cmd.Path}, args...), " "))
 	fmt.Fprintf(os.Stdout, "[codex] exec: %s\n", cmdline)
 
-	cmd.Stdout = io.MultiWriter(&stdout, os.Stdout)
-	cmd.Stderr = io.MultiWriter(&stderr, os.Stderr)
+	// Capture agent output without mirroring it to process logs to avoid
+	// log spam from long model responses.
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
 		out := stdout.String()

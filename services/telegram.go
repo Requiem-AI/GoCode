@@ -1,6 +1,7 @@
 package services
 
 import (
+	ctx "context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,6 +42,9 @@ type TelegramService struct {
 	pingServer        *http.Server
 	runQueueMu        sync.Mutex
 	runQueues         map[string]chan func()
+	outboundQueue     chan *telegramOutboundTask
+	outboundStop      chan struct{}
+	outboundWG        sync.WaitGroup
 
 	deleteTopicMarkup  *tb.ReplyMarkup
 	deleteTopicConfirm tb.Btn
@@ -58,8 +62,80 @@ type detectedFileURI struct {
 	Path string
 }
 
+type telegramOutboundTask struct {
+	kind        string
+	attempt     int
+	maxAttempts int
+	backoff     time.Duration
+	run         func() error
+	done        chan error
+	doneOnce    sync.Once
+}
+
 const TELEGRAM_SVC = "telegram_svc"
+
 var fileURIPattern = regexp.MustCompile(`file://[^\s<>"'` + "`" + `]+`)
+
+// safeWebhookPoller mirrors telebot's webhook poller behavior but avoids
+// closing the shared stop channel, which can panic on shutdown.
+type safeWebhookPoller struct {
+	webhook *tb.Webhook
+}
+
+func (p *safeWebhookPoller) Poll(b *tb.Bot, dest chan tb.Update, stop chan struct{}) {
+	if err := b.SetWebhook(p.webhook); err != nil {
+		b.OnError(err, nil)
+		close(stop)
+		return
+	}
+
+	if p.webhook.Listen == "" {
+		<-stop
+		return
+	}
+
+	server := &http.Server{
+		Addr:    p.webhook.Listen,
+		Handler: &safeWebhookHandler{
+			secretToken: p.webhook.SecretToken,
+			dest:        dest,
+		},
+	}
+
+	go func() {
+		<-stop
+		if err := server.Shutdown(ctx.Background()); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			b.OnError(err, nil)
+		}
+	}()
+
+	var err error
+	if p.webhook.TLS != nil {
+		err = server.ListenAndServeTLS(p.webhook.TLS.Cert, p.webhook.TLS.Key)
+	} else {
+		err = server.ListenAndServe()
+	}
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		b.OnError(err, nil)
+	}
+}
+
+type safeWebhookHandler struct {
+	secretToken string
+	dest        chan<- tb.Update
+}
+
+func (h *safeWebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.secretToken != "" && r.Header.Get("X-Telegram-Bot-Api-Secret-Token") != h.secretToken {
+		return
+	}
+
+	var update tb.Update
+	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+		return
+	}
+	h.dest <- update
+}
 
 func (svc TelegramService) Id() string {
 	return TELEGRAM_SVC
@@ -81,14 +157,16 @@ func (svc *TelegramService) Configure(ctx *context.Context) (err error) {
 		return fmt.Errorf("TELEGRAM_PORT is required for webhook mode")
 	}
 
+	webhook := &tb.Webhook{
+		Listen: fmt.Sprintf(":%d", svc.port),
+		Endpoint: &tb.WebhookEndpoint{
+			PublicURL: os.Getenv("TELEGRAM_WEBHOOK"),
+		},
+	}
+
 	svc.Bot, err = tb.NewBot(tb.Settings{
 		Token: os.Getenv("TELEGRAM_SECRET"),
-		Poller: &tb.Webhook{
-			Listen: fmt.Sprintf(":%d", svc.port),
-			Endpoint: &tb.WebhookEndpoint{
-				PublicURL: os.Getenv("TELEGRAM_WEBHOOK"),
-			},
-		},
+		Poller: &safeWebhookPoller{webhook: webhook},
 		Client: &http.Client{
 			Timeout: 60 * time.Second,
 		},
@@ -102,6 +180,8 @@ func (svc *TelegramService) Configure(ctx *context.Context) (err error) {
 
 	svc.topicContexts = make(map[string]*TopicContext)
 	svc.runQueues = make(map[string]chan func())
+	svc.outboundQueue = make(chan *telegramOutboundTask, 256)
+	svc.outboundStop = make(chan struct{})
 	path := strings.TrimSpace(os.Getenv("TELEGRAM_TOPIC_CONTEXTS_PATH"))
 	if path == "" {
 		path = filepath.Join("data", "telegram_topics.json")
@@ -125,6 +205,7 @@ func (svc *TelegramService) Start() error {
 		log.Error().Err(err).Msg("failed to load topic contexts")
 	}
 
+	svc.startOutboundWorkers()
 	svc.setupHandlers()
 	svc.setupEvents()
 	svc.sendOnlineMessage()
@@ -139,6 +220,7 @@ func (svc *TelegramService) Start() error {
 
 func (svc *TelegramService) Shutdown() {
 	log.Info().Msg("telegram service shutting down")
+	svc.stopOutboundWorkers()
 	if svc.pingServer != nil {
 		if err := svc.pingServer.Close(); err != nil {
 			log.Error().Err(err).Msg("ping server shutdown error")
@@ -354,6 +436,128 @@ func (svc *TelegramService) startPingServer() {
 	}()
 }
 
+func (svc *TelegramService) startOutboundWorkers() {
+	const workerCount = 4
+	for i := 0; i < workerCount; i++ {
+		svc.outboundWG.Add(1)
+		go svc.processOutboundQueue(i + 1)
+	}
+}
+
+func (svc *TelegramService) stopOutboundWorkers() {
+	select {
+	case <-svc.outboundStop:
+		return
+	default:
+		close(svc.outboundStop)
+	}
+
+	for {
+		select {
+		case task := <-svc.outboundQueue:
+			svc.completeOutboundTask(task, errors.New("telegram service shutting down"))
+		default:
+			svc.outboundWG.Wait()
+			return
+		}
+	}
+}
+
+func (svc *TelegramService) processOutboundQueue(workerID int) {
+	defer svc.outboundWG.Done()
+	logger := log.With().Int("worker", workerID).Logger()
+
+	for {
+		select {
+		case <-svc.outboundStop:
+			return
+		case task := <-svc.outboundQueue:
+			if task == nil || task.run == nil {
+				continue
+			}
+
+			task.attempt++
+			err := task.run()
+			if err == nil {
+				svc.completeOutboundTask(task, nil)
+				continue
+			}
+
+			retryable := isRetryableTelegramSendError(err)
+			if retryable && task.attempt < task.maxAttempts {
+				delay := task.backoff
+				if delay <= 0 {
+					delay = 250 * time.Millisecond
+				}
+				task.backoff = delay * 2
+				logger.Warn().
+					Err(err).
+					Str("kind", task.kind).
+					Int("attempt", task.attempt).
+					Dur("retry_in", delay).
+					Msg("telegram outbound task failed; requeueing")
+				svc.scheduleOutboundRequeue(task, delay)
+				continue
+			}
+
+			logger.Warn().
+				Err(err).
+				Str("kind", task.kind).
+				Int("attempt", task.attempt).
+				Bool("retryable", retryable).
+				Msg("telegram outbound task failed; giving up")
+			svc.completeOutboundTask(task, err)
+		}
+	}
+}
+
+func (svc *TelegramService) scheduleOutboundRequeue(task *telegramOutboundTask, delay time.Duration) {
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+
+		select {
+		case <-svc.outboundStop:
+			svc.completeOutboundTask(task, errors.New("telegram service shutting down"))
+			return
+		case <-timer.C:
+		}
+
+		if err := svc.enqueueOutboundTask(task); err != nil {
+			svc.completeOutboundTask(task, err)
+		}
+	}()
+}
+
+func (svc *TelegramService) enqueueOutboundTask(task *telegramOutboundTask) error {
+	if task == nil || task.run == nil {
+		return errors.New("invalid telegram outbound task")
+	}
+
+	select {
+	case <-svc.outboundStop:
+		return errors.New("telegram outbound queue stopped")
+	default:
+	}
+
+	select {
+	case svc.outboundQueue <- task:
+		return nil
+	default:
+		return errors.New("telegram outbound queue full")
+	}
+}
+
+func (svc *TelegramService) completeOutboundTask(task *telegramOutboundTask, err error) {
+	if task == nil || task.done == nil {
+		return
+	}
+	task.doneOnce.Do(func() {
+		task.done <- err
+		close(task.done)
+	})
+}
+
 func (svc *TelegramService) onText(c tb.Context) error {
 	msg := c.Message()
 	if msg == nil {
@@ -391,7 +595,7 @@ func (svc *TelegramService) onText(c tb.Context) error {
 	svc.enqueueWork(chat, threadID, func() {
 		logger := log.With().Int64("chat_id", chat.ID).Int("thread_id", threadID).Logger()
 
-		if err := svc.Bot.React(chat, msgRef, tb.ReactionOptions{Reactions: []tb.Reaction{{
+		if err := svc.reactWithRetry(chat, msgRef, tb.ReactionOptions{Reactions: []tb.Reaction{{
 			Type:  "emoji",
 			Emoji: "👍",
 		}}}); err != nil {
@@ -710,7 +914,7 @@ func (svc *TelegramService) sendDetectedFiles(chat *tb.Chat, baseOpts *tb.SendOp
 			File:     tb.FromDisk(resolvedPath),
 			FileName: filepath.Base(resolvedPath),
 		}
-		if _, err := svc.Bot.Send(chat, doc, opts); err != nil {
+		if _, err := svc.sendDocumentWithRetry(chat, doc, opts); err != nil {
 			failures = append(failures, fmt.Sprintf("%s (%s)", file.Raw, err.Error()))
 		}
 	}
@@ -874,7 +1078,7 @@ func (svc *TelegramService) editOrSendByMessageID(chat *tb.Chat, baseOpts *tb.Se
 		return messageID, err
 	}
 
-	sentMsg, err := svc.Bot.Send(chat, text, opts)
+	sentMsg, err := svc.sendWithRetry(chat, text, opts)
 	if err != nil {
 		return messageID, err
 	}
@@ -890,32 +1094,71 @@ func cloneSendOptions(opts *tb.SendOptions) *tb.SendOptions {
 }
 
 func (svc *TelegramService) sendWithRetry(chat *tb.Chat, text string, opts *tb.SendOptions) (*tb.Message, error) {
-	const maxAttempts = 3
-	backoff := 250 * time.Millisecond
-	var msg *tb.Message
-	var err error
-
 	if opts == nil {
 		opts = &tb.SendOptions{}
 	}
 
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		log.Debug().Int("attempt", attempt).Int("text_len", len(text)).Msg("sendWithRetry: attempting send")
-		msg, err = svc.Bot.Send(chat, text, opts)
-		if err == nil {
-			log.Debug().Int("attempt", attempt).Msg("sendWithRetry: sent successfully")
-			return msg, err
-		}
-		if !isRetryableTelegramSendError(err) || attempt == maxAttempts {
-			log.Warn().Err(err).Int("attempt", attempt).Bool("retryable", isRetryableTelegramSendError(err)).Msg("sendWithRetry: giving up")
-			return msg, err
-		}
-		log.Warn().Err(err).Int("attempt", attempt).Dur("backoff", backoff).Msg("sendWithRetry: retrying after error")
-		time.Sleep(backoff)
-		backoff *= 2
+	var sent *tb.Message
+	task := &telegramOutboundTask{
+		kind:        "send_message",
+		maxAttempts: 3,
+		backoff:     250 * time.Millisecond,
+		done:        make(chan error, 1),
+		run: func() error {
+			var err error
+			sent, err = svc.Bot.Send(chat, text, opts)
+			return err
+		},
+	}
+	if err := svc.enqueueOutboundTask(task); err != nil {
+		return nil, err
+	}
+	if err := <-task.done; err != nil {
+		return sent, err
+	}
+	return sent, nil
+}
+
+func (svc *TelegramService) sendDocumentWithRetry(chat *tb.Chat, doc *tb.Document, opts *tb.SendOptions) (*tb.Message, error) {
+	if opts == nil {
+		opts = &tb.SendOptions{}
 	}
 
-	return msg, err
+	var sent *tb.Message
+	task := &telegramOutboundTask{
+		kind:        "send_document",
+		maxAttempts: 3,
+		backoff:     250 * time.Millisecond,
+		done:        make(chan error, 1),
+		run: func() error {
+			var err error
+			sent, err = svc.Bot.Send(chat, doc, opts)
+			return err
+		},
+	}
+	if err := svc.enqueueOutboundTask(task); err != nil {
+		return nil, err
+	}
+	if err := <-task.done; err != nil {
+		return sent, err
+	}
+	return sent, nil
+}
+
+func (svc *TelegramService) reactWithRetry(chat *tb.Chat, msg *tb.Message, opts tb.ReactionOptions) error {
+	task := &telegramOutboundTask{
+		kind:        "react",
+		maxAttempts: 3,
+		backoff:     250 * time.Millisecond,
+		done:        make(chan error, 1),
+		run: func() error {
+			return svc.Bot.React(chat, msg, opts)
+		},
+	}
+	if err := svc.enqueueOutboundTask(task); err != nil {
+		return err
+	}
+	return <-task.done
 }
 
 func isRetryableTelegramSendError(err error) bool {
