@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,7 +53,13 @@ type TopicContext struct {
 	RepoPath string
 }
 
+type detectedFileURI struct {
+	Raw  string
+	Path string
+}
+
 const TELEGRAM_SVC = "telegram_svc"
+var fileURIPattern = regexp.MustCompile(`file://[^\s<>"'` + "`" + `]+`)
 
 func (svc TelegramService) Id() string {
 	return TELEGRAM_SVC
@@ -555,7 +562,169 @@ func (svc *TelegramService) runAgentWithPendingUpdates(chat *tb.Chat, opts *tb.S
 	}
 	if sendErr != nil {
 		logger.Error().Err(sendErr).Msg("failed to send final agent response")
+		return
 	}
+
+	fileURIs := detectFileURIs(resp)
+	if len(fileURIs) == 0 {
+		return
+	}
+	if err := svc.sendDetectedFiles(chat, opts, repoPath, fileURIs); err != nil {
+		logger.Warn().Err(err).Int("count", len(fileURIs)).Msg("failed to send one or more file attachments")
+	}
+}
+
+func detectFileURIs(text string) []detectedFileURI {
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+
+	matches := fileURIPattern.FindAllString(text, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(matches))
+	files := make([]detectedFileURI, 0, len(matches))
+	for _, match := range matches {
+		candidate := trimFileURI(match)
+		if candidate == "" {
+			continue
+		}
+		decoded, err := parseFileURIPath(candidate)
+		if err != nil || decoded == "" {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		files = append(files, detectedFileURI{
+			Raw:  candidate,
+			Path: decoded,
+		})
+	}
+
+	return files
+}
+
+func trimFileURI(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+
+	const trailing = ".,;:!?)]}>"
+	return strings.TrimRight(trimmed, trailing)
+}
+
+func parseFileURIPath(raw string) (string, error) {
+	if !strings.HasPrefix(raw, "file://") {
+		return "", fmt.Errorf("not a file uri")
+	}
+
+	withoutScheme := strings.TrimPrefix(raw, "file://")
+	if withoutScheme == "" {
+		return "", fmt.Errorf("missing file path")
+	}
+
+	decoded, err := url.PathUnescape(withoutScheme)
+	if err != nil {
+		return "", err
+	}
+
+	return decoded, nil
+}
+
+func resolveFilePath(repoPath, candidatePath string) (string, error) {
+	candidatePath = strings.TrimSpace(candidatePath)
+	if candidatePath == "" {
+		return "", fmt.Errorf("empty file path")
+	}
+
+	var resolved string
+	switch {
+	case filepath.IsAbs(candidatePath):
+		resolved = filepath.Clean(candidatePath)
+	case repoPath != "":
+		resolved = filepath.Join(repoPath, candidatePath)
+	default:
+		absPath, err := filepath.Abs(candidatePath)
+		if err != nil {
+			return "", err
+		}
+		resolved = absPath
+	}
+
+	if repoPath == "" {
+		return resolved, nil
+	}
+
+	repoAbs, err := filepath.Abs(repoPath)
+	if err != nil {
+		return "", err
+	}
+	targetAbs, err := filepath.Abs(resolved)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(repoAbs, targetAbs)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("outside topic repo")
+	}
+
+	return targetAbs, nil
+}
+
+func (svc *TelegramService) sendDetectedFiles(chat *tb.Chat, baseOpts *tb.SendOptions, repoPath string, files []detectedFileURI) error {
+	if len(files) == 0 {
+		return nil
+	}
+
+	opts := cloneSendOptions(baseOpts)
+	opts.ParseMode = ""
+	opts.DisableNotification = false
+
+	var failures []string
+	for _, file := range files {
+		resolvedPath, err := resolveFilePath(repoPath, file.Path)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s (%s)", file.Raw, err.Error()))
+			continue
+		}
+
+		info, err := os.Stat(resolvedPath)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s (%s)", file.Raw, err.Error()))
+			continue
+		}
+		if info.IsDir() {
+			failures = append(failures, fmt.Sprintf("%s (is a directory)", file.Raw))
+			continue
+		}
+
+		doc := &tb.Document{
+			File:     tb.FromDisk(resolvedPath),
+			FileName: filepath.Base(resolvedPath),
+		}
+		if _, err := svc.Bot.Send(chat, doc, opts); err != nil {
+			failures = append(failures, fmt.Sprintf("%s (%s)", file.Raw, err.Error()))
+		}
+	}
+
+	if len(failures) == 0 {
+		return nil
+	}
+
+	errMsg := "Some file attachments could not be sent:\n- " + strings.Join(failures, "\n- ")
+	_, sendErr := svc.sendWithRetry(chat, truncateTelegramText(errMsg), opts)
+	if sendErr != nil {
+		return sendErr
+	}
+	return errors.New("one or more file attachments failed")
 }
 
 // enqueueWork submits a function to run without blocking the telebot handler.
