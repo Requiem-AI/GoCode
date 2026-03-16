@@ -533,6 +533,40 @@ func (svc *GitService) PullMain(repo *GitRepo) error {
 	return svc.runGit(repo.Path, "pull")
 }
 
+func (svc *GitService) RunTopicGitCommand(repo *GitRepo, args ...string) (string, error) {
+	if repo == nil {
+		return "", errors.New("repo is nil")
+	}
+	if len(args) == 0 {
+		return "", errors.New("git args are required")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), gitCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", repo.Path}, args...)...)
+	cmd.Env = append(os.Environ(),
+		"GIT_TERMINAL_PROMPT=0",
+		"GCM_INTERACTIVE=never",
+	)
+	output, err := cmd.CombinedOutput()
+	trimmed := strings.TrimSpace(string(output))
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			if trimmed == "" {
+				return "", fmt.Errorf("git command timed out after %s", gitCommandTimeout)
+			}
+			return trimmed, fmt.Errorf("git command timed out after %s", gitCommandTimeout)
+		}
+		if trimmed == "" {
+			return "", err
+		}
+		return trimmed, err
+	}
+
+	return trimmed, nil
+}
+
 func (svc *GitService) initRepo(repoPath string) error {
 	if err := os.MkdirAll(repoPath, 0o775); err != nil {
 		return err

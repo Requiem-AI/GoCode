@@ -250,6 +250,34 @@ func TestParseCommandText_RejectsNonCommand(t *testing.T) {
 	}
 }
 
+func TestParseCommandText_GitWithPayload(t *testing.T) {
+	cmd, payload, ok := parseCommandText("/git status --short")
+	if !ok {
+		t.Fatalf("expected command parse to succeed")
+	}
+	if cmd != "/git" {
+		t.Fatalf("cmd = %q, want %q", cmd, "/git")
+	}
+	if payload != "status --short" {
+		t.Fatalf("payload = %q, want %q", payload, "status --short")
+	}
+}
+
+func TestTruncateTelegramText(t *testing.T) {
+	in := ""
+	for i := 0; i < 5000; i++ {
+		in += "a"
+	}
+
+	got := truncateTelegramText(in)
+	if len(got) > 3900+len("\n\n[output truncated]") {
+		t.Fatalf("unexpected output length: %d", len(got))
+	}
+	if got[len(got)-len("[output truncated]"):] != "[output truncated]" {
+		t.Fatalf("expected truncated suffix in output")
+	}
+}
+
 func TestProcessRunQueue_SerializesTasks(t *testing.T) {
 	svc := &TelegramService{
 		runQueues: make(map[string]chan func()),
