@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/requiem-ai/gocode/context"
 	"github.com/rs/zerolog"
@@ -716,7 +717,7 @@ func (svc *TelegramService) runAgentWithPendingUpdates(chat *tb.Chat, opts *tb.S
 	go func() {
 		defer close(updatesDone)
 
-		ticker := time.NewTicker(10 * time.Second)
+		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 
 		for {
@@ -750,7 +751,8 @@ func (svc *TelegramService) runAgentWithPendingUpdates(chat *tb.Chat, opts *tb.S
 
 	if runErr != nil {
 		logger.Error().Err(runErr).Dur("elapsed", elapsed).Msg("agent.Run failed")
-		if err := svc.sendFinalResponse(chat, opts, int(pendingMessageID.Load()), "Agent failed to run.", ""); err != nil {
+		failureText := formatAgentFailureResponse(runErr, resp)
+		if err := svc.sendFinalResponse(chat, opts, int(pendingMessageID.Load()), failureText, ""); err != nil {
 			logger.Warn().Err(err).Msg("failed to send agent failure response")
 		}
 		return
@@ -758,24 +760,72 @@ func (svc *TelegramService) runAgentWithPendingUpdates(chat *tb.Chat, opts *tb.S
 
 	logger.Info().Dur("elapsed", elapsed).Int("response_len", len(resp)).Msg("agent.Run completed")
 
-	escaped := escapeMarkdownV2(resp)
+	fileURIs := detectFileURIs(resp)
+	responseText := resp
+	if len(fileURIs) > 0 {
+		responseText = stripDetectedFileURIs(responseText, fileURIs)
+	}
+	escaped := escapeMarkdownV2(responseText)
+	if len(fileURIs) > 0 {
+		resolvedPath, usedIdx, resolveErr := resolveFirstDetectedFilePath(repoPath, fileURIs)
+		if resolveErr == nil && utf8.RuneCountInString(resp) <= telegramMaxCaptionLength {
+			sendErr := svc.sendFinalResponseDocument(chat, opts, int(pendingMessageID.Load()), escaped, tb.ModeMarkdownV2, resolvedPath)
+			if sendErr != nil {
+				logger.Warn().Err(sendErr).Msg("markdownV2 document send failed, retrying as plain text")
+				sendErr = svc.sendFinalResponseDocument(chat, opts, int(pendingMessageID.Load()), responseText, "", resolvedPath)
+			}
+			if sendErr == nil {
+				remaining := removeDetectedFileByIndex(fileURIs, usedIdx)
+				if err := svc.sendDetectedFiles(chat, opts, repoPath, remaining); err != nil {
+					logger.Warn().Err(err).Int("count", len(remaining)).Msg("failed to send one or more additional file attachments")
+				}
+				return
+			}
+			logger.Warn().Err(sendErr).Msg("failed to send final agent response with attachment, falling back to text response")
+		}
+	}
+
 	sendErr := svc.sendFinalResponse(chat, opts, int(pendingMessageID.Load()), escaped, tb.ModeMarkdownV2)
 	if sendErr != nil {
 		logger.Warn().Err(sendErr).Msg("markdownV2 send failed, retrying as plain text")
-		sendErr = svc.sendFinalResponse(chat, opts, int(pendingMessageID.Load()), resp, "")
+		sendErr = svc.sendFinalResponse(chat, opts, int(pendingMessageID.Load()), responseText, "")
 	}
 	if sendErr != nil {
 		logger.Error().Err(sendErr).Msg("failed to send final agent response")
 		return
 	}
 
-	fileURIs := detectFileURIs(resp)
 	if len(fileURIs) == 0 {
 		return
 	}
 	if err := svc.sendDetectedFiles(chat, opts, repoPath, fileURIs); err != nil {
 		logger.Warn().Err(err).Int("count", len(fileURIs)).Msg("failed to send one or more file attachments")
 	}
+}
+
+const maxAgentFailureDetailsLen = 3000
+
+func formatAgentFailureResponse(runErr error, output string) string {
+	lines := []string{"Agent failed to run."}
+	if runErr != nil {
+		lines = append(lines, "Error: "+strings.TrimSpace(runErr.Error()))
+	}
+
+	cleaned := strings.TrimSpace(output)
+	if cleaned == "" {
+		return strings.Join(lines, "\n")
+	}
+
+	if runErr != nil && cleaned == strings.TrimSpace(runErr.Error()) {
+		return strings.Join(lines, "\n")
+	}
+
+	if len(cleaned) > maxAgentFailureDetailsLen {
+		cleaned = cleaned[:maxAgentFailureDetailsLen] + "\n...[truncated]"
+	}
+
+	lines = append(lines, "", "Agent output:", cleaned)
+	return strings.Join(lines, "\n")
 }
 
 func detectFileURIs(text string) []detectedFileURI {
@@ -810,6 +860,27 @@ func detectFileURIs(text string) []detectedFileURI {
 	}
 
 	return files
+}
+
+func stripDetectedFileURIs(text string, files []detectedFileURI) string {
+	if strings.TrimSpace(text) == "" || len(files) == 0 {
+		return text
+	}
+
+	cleaned := text
+	for _, file := range files {
+		raw := strings.TrimSpace(file.Raw)
+		if raw == "" {
+			continue
+		}
+
+		// Convert markdown links like [artifact](file://path) to plain "artifact".
+		linkPattern := regexp.MustCompile(`\[([^\]]+)\]\(` + regexp.QuoteMeta(raw) + `\)`)
+		cleaned = linkPattern.ReplaceAllString(cleaned, `$1`)
+		cleaned = strings.ReplaceAll(cleaned, raw, "")
+	}
+
+	return strings.TrimSpace(cleaned)
 }
 
 func trimFileURI(value string) string {
@@ -881,6 +952,31 @@ func resolveFilePath(repoPath, candidatePath string) (string, error) {
 	}
 
 	return targetAbs, nil
+}
+
+func resolveFirstDetectedFilePath(repoPath string, files []detectedFileURI) (string, int, error) {
+	for i, file := range files {
+		resolvedPath, err := resolveFilePath(repoPath, file.Path)
+		if err != nil {
+			continue
+		}
+		info, err := os.Stat(resolvedPath)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		return resolvedPath, i, nil
+	}
+	return "", -1, errors.New("no sendable detected files")
+}
+
+func removeDetectedFileByIndex(files []detectedFileURI, idx int) []detectedFileURI {
+	if idx < 0 || idx >= len(files) {
+		return files
+	}
+	remaining := make([]detectedFileURI, 0, len(files)-1)
+	remaining = append(remaining, files[:idx]...)
+	remaining = append(remaining, files[idx+1:]...)
+	return remaining
 }
 
 func (svc *TelegramService) sendDetectedFiles(chat *tb.Chat, baseOpts *tb.SendOptions, repoPath string, files []detectedFileURI) error {
@@ -1014,6 +1110,35 @@ func (svc *TelegramService) sendFinalResponse(chat *tb.Chat, baseOpts *tb.SendOp
 }
 
 const telegramMaxMessageLength = 4096
+const telegramMaxCaptionLength = 1024
+
+func (svc *TelegramService) sendFinalResponseDocument(chat *tb.Chat, baseOpts *tb.SendOptions, pendingMessageID int, text, parseMode, filePath string) error {
+	log.Debug().Int("pending_msg_id", pendingMessageID).Int("text_len", len(text)).Str("parse_mode", parseMode).Str("file", filePath).Msg("sendFinalResponseDocument")
+
+	if pendingMessageID != 0 {
+		pending := tb.StoredMessage{
+			MessageID: strconv.Itoa(pendingMessageID),
+			ChatID:    chat.ID,
+		}
+		if err := svc.Bot.Delete(pending); err != nil {
+			log.Warn().Err(err).Int("message_id", pendingMessageID).Msg("failed to delete pending message")
+		}
+	}
+
+	opts := cloneSendOptions(baseOpts)
+	opts.DisableNotification = false
+	if parseMode != "" {
+		opts.ParseMode = parseMode
+	}
+
+	doc := &tb.Document{
+		File:     tb.FromDisk(filePath),
+		FileName: filepath.Base(filePath),
+		Caption:  text,
+	}
+	_, err := svc.sendDocumentWithRetry(chat, doc, opts)
+	return err
+}
 
 // splitMessage splits text into chunks that fit within maxLen.
 // It prefers splitting at newline boundaries. If a single line exceeds maxLen,
@@ -1528,12 +1653,12 @@ func (svc *TelegramService) createWorkingBranch(repo *GitRepo, branch string) (s
 	return svc.git.CreateWorkingBranch(repo, branch)
 }
 
-func (svc *TelegramService) commitAndOpenPR(repo *GitRepo, message string) (*CommitPRResult, error) {
+func (svc *TelegramService) commitAndOpenPR(repo *GitRepo, message, prBody string) (*CommitPRResult, error) {
 	if svc.git == nil {
 		return nil, errors.New("git service not available")
 	}
 
-	return svc.git.CommitPushAndOpenPR(repo, message)
+	return svc.git.CommitPushAndOpenPR(repo, message, prBody)
 }
 
 func (svc *TelegramService) parseTopicArgs(payload string) (string, string, string) {
@@ -1935,6 +2060,23 @@ func (svc *TelegramService) onCommit(c tb.Context) error {
 		return c.Send("Couldn't prepare the repo for this topic.", &tb.SendOptions{ThreadID: msg.ThreadID})
 	}
 
+	commitMessage := strings.TrimSpace(msg.Payload)
+	if commitMessage == "" {
+		generated, genErr := svc.generateCommitMessage(repo)
+		if genErr != nil {
+			log.Warn().Err(genErr).Str("repo_path", repo.Path).Msg("failed to generate commit message with agent; using fallback")
+		} else {
+			commitMessage = generated
+		}
+	}
+	prBody := ""
+	generatedPRBody, prBodyErr := svc.generatePRDescription(repo, commitMessage)
+	if prBodyErr != nil {
+		log.Warn().Err(prBodyErr).Str("repo_path", repo.Path).Msg("failed to generate pr description with agent; using fallback")
+	} else {
+		prBody = generatedPRBody
+	}
+
 	pendingID := 0
 	pendingOpts := &tb.SendOptions{ThreadID: msg.ThreadID, DisableNotification: true}
 	pendingID, err = svc.editOrSendByMessageID(c.Chat(), pendingOpts, pendingID, "Running commit flow...", "")
@@ -1943,7 +2085,7 @@ func (svc *TelegramService) onCommit(c tb.Context) error {
 		pendingID = 0
 	}
 
-	result, err := svc.commitAndOpenPR(repo, msg.Payload)
+	result, err := svc.commitAndOpenPR(repo, commitMessage, prBody)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to commit and open pr")
 		return svc.sendFinalResponse(c.Chat(), &tb.SendOptions{ThreadID: msg.ThreadID}, pendingID, fmt.Sprintf("Commit flow failed: %s", err.Error()), "")
@@ -1951,6 +2093,129 @@ func (svc *TelegramService) onCommit(c tb.Context) error {
 
 	resp := fmt.Sprintf("Committed and pushed to %s\nMessage: %s\nPR: %s", result.Branch, result.CommitMessage, result.PRURL)
 	return svc.sendFinalResponse(c.Chat(), &tb.SendOptions{ThreadID: msg.ThreadID}, pendingID, resp, "")
+}
+
+func (svc *TelegramService) generateCommitMessage(repo *GitRepo) (string, error) {
+	if repo == nil {
+		return "", errors.New("repo is nil")
+	}
+	if svc.agent == nil {
+		return "", errors.New("agent service unavailable")
+	}
+
+	const prompt = `Generate a concise Git commit subject for the current repository changes.
+Inspect the working tree and staged diff as needed.
+Return only the commit subject line.
+Requirements:
+- imperative mood
+- max 72 characters
+- no quotes, markdown, bullets, or code fences`
+
+	resp, err := svc.agent.Run(repo.Path, prompt)
+	if err != nil {
+		return "", err
+	}
+
+	commitMessage := sanitizeAgentCommitMessage(resp)
+	if commitMessage == "" {
+		return "", errors.New("agent returned an empty commit message")
+	}
+
+	return commitMessage, nil
+}
+
+func (svc *TelegramService) generatePRDescription(repo *GitRepo, commitMessage string) (string, error) {
+	if repo == nil {
+		return "", errors.New("repo is nil")
+	}
+	if svc.agent == nil {
+		return "", errors.New("agent service unavailable")
+	}
+
+	prompt := fmt.Sprintf(`Generate a concise GitHub pull request description for the current repository changes.
+Inspect the working tree and staged diff as needed.
+Return only the PR description text (plain text, no markdown fences).
+Commit subject: %s
+Requirements:
+- 2 to 5 short bullet points
+- each bullet starts with "- "
+- include what changed and why`, strings.TrimSpace(commitMessage))
+
+	resp, err := svc.agent.Run(repo.Path, prompt)
+	if err != nil {
+		return "", err
+	}
+
+	prBody := sanitizeAgentPRBody(resp)
+	if prBody == "" {
+		return "", errors.New("agent returned an empty pr description")
+	}
+
+	return prBody, nil
+}
+
+func sanitizeAgentCommitMessage(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+
+	for _, line := range strings.Split(trimmed, "\n") {
+		candidate := strings.TrimSpace(line)
+		if candidate == "" {
+			continue
+		}
+		if strings.EqualFold(candidate, "new session started.") {
+			continue
+		}
+		lower := strings.ToLower(candidate)
+		if strings.HasPrefix(lower, "commit message:") {
+			candidate = strings.TrimSpace(candidate[len("commit message:"):])
+		}
+		candidate = strings.TrimSpace(strings.Trim(candidate, "`\"'"))
+		if candidate == "" {
+			continue
+		}
+		return candidate
+	}
+
+	return ""
+}
+
+func sanitizeAgentPRBody(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+
+	lines := strings.Split(trimmed, "\n")
+	cleaned := make([]string, 0, len(lines))
+	for _, line := range lines {
+		candidate := strings.TrimSpace(line)
+		if candidate == "" {
+			continue
+		}
+		if strings.EqualFold(candidate, "new session started.") {
+			continue
+		}
+
+		lower := strings.ToLower(candidate)
+		if strings.HasPrefix(lower, "pr description:") {
+			candidate = strings.TrimSpace(candidate[len("pr description:"):])
+		}
+		if strings.HasPrefix(candidate, "```") {
+			continue
+		}
+
+		candidate = strings.TrimSpace(strings.Trim(candidate, "`"))
+		if candidate == "" {
+			continue
+		}
+
+		cleaned = append(cleaned, candidate)
+	}
+
+	return strings.TrimSpace(strings.Join(cleaned, "\n"))
 }
 
 func truncateTelegramText(text string) string {

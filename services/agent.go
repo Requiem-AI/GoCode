@@ -29,10 +29,7 @@ func (svc *AgentService) Run(repoPath string, msg string) (string, error) {
 		RepoPath: repoPath,
 		Message:  msg,
 	})
-	if err != nil {
-		return "", err
-	}
-	return resp.Text, nil
+	return resp.Text, err
 }
 
 func (svc *AgentService) Clear(repoPath string) error {

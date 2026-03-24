@@ -3,6 +3,7 @@ package services
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -445,6 +446,25 @@ func TestDetectFileURIs_DeduplicatesAndTrims(t *testing.T) {
 	}
 }
 
+func TestStripDetectedFileURIs_RemovesStandaloneURIs(t *testing.T) {
+	text := "Created output file://reports/summary.txt and file:///tmp/build.log"
+	files := detectFileURIs(text)
+	got := stripDetectedFileURIs(text, files)
+	if strings.Contains(got, "file://") {
+		t.Fatalf("expected no file URI in output, got %q", got)
+	}
+}
+
+func TestStripDetectedFileURIs_RewritesMarkdownLinks(t *testing.T) {
+	text := "Use [artifact](file://out/app.tar.gz)."
+	files := detectFileURIs(text)
+	got := stripDetectedFileURIs(text, files)
+	want := "Use artifact."
+	if got != want {
+		t.Fatalf("stripDetectedFileURIs() = %q, want %q", got, want)
+	}
+}
+
 func TestResolveFilePath_RepoRelative(t *testing.T) {
 	repo := t.TempDir()
 	path, err := resolveFilePath(repo, "build/output.txt")
@@ -460,5 +480,143 @@ func TestResolveFilePath_RejectsOutsideRepo(t *testing.T) {
 	repo := t.TempDir()
 	if _, err := resolveFilePath(repo, "../secrets.txt"); err == nil {
 		t.Fatalf("expected outside-repo path to be rejected")
+	}
+}
+
+func TestResolveFirstDetectedFilePath_PicksFirstSendable(t *testing.T) {
+	repo := t.TempDir()
+	validPath := filepath.Join(repo, "out.txt")
+	if err := os.WriteFile(validPath, []byte("ok"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	files := []detectedFileURI{
+		{Raw: "file://missing.txt", Path: "missing.txt"},
+		{Raw: "file://out.txt", Path: "out.txt"},
+	}
+
+	resolved, idx, err := resolveFirstDetectedFilePath(repo, files)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if idx != 1 {
+		t.Fatalf("expected idx 1, got %d", idx)
+	}
+	if resolved != validPath {
+		t.Fatalf("resolved path = %q, want %q", resolved, validPath)
+	}
+}
+
+func TestResolveFirstDetectedFilePath_NoSendableFiles(t *testing.T) {
+	repo := t.TempDir()
+	files := []detectedFileURI{
+		{Raw: "file://missing.txt", Path: "missing.txt"},
+		{Raw: "file://../outside.txt", Path: "../outside.txt"},
+	}
+
+	_, _, err := resolveFirstDetectedFilePath(repo, files)
+	if err == nil {
+		t.Fatalf("expected error for no sendable files")
+	}
+}
+
+func TestRemoveDetectedFileByIndex(t *testing.T) {
+	files := []detectedFileURI{
+		{Raw: "file://one.txt", Path: "one.txt"},
+		{Raw: "file://two.txt", Path: "two.txt"},
+		{Raw: "file://three.txt", Path: "three.txt"},
+	}
+	got := removeDetectedFileByIndex(files, 1)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(got))
+	}
+	if got[0].Raw != "file://one.txt" || got[1].Raw != "file://three.txt" {
+		t.Fatalf("unexpected files after removal: %+v", got)
+	}
+}
+
+func TestFormatAgentFailureResponse_ErrorOnly(t *testing.T) {
+	got := formatAgentFailureResponse(errors.New("exit status 1"), "")
+	want := "Agent failed to run.\nError: exit status 1"
+	if got != want {
+		t.Fatalf("formatAgentFailureResponse() = %q, want %q", got, want)
+	}
+}
+
+func TestFormatAgentFailureResponse_WithAgentOutput(t *testing.T) {
+	got := formatAgentFailureResponse(errors.New("exit status 1"), "failed to find CODEX_BIN")
+	want := "Agent failed to run.\nError: exit status 1\n\nAgent output:\nfailed to find CODEX_BIN"
+	if got != want {
+		t.Fatalf("formatAgentFailureResponse() = %q, want %q", got, want)
+	}
+}
+
+func TestFormatAgentFailureResponse_DeduplicatesErrorText(t *testing.T) {
+	got := formatAgentFailureResponse(errors.New("exit status 1"), "exit status 1")
+	want := "Agent failed to run.\nError: exit status 1"
+	if got != want {
+		t.Fatalf("formatAgentFailureResponse() = %q, want %q", got, want)
+	}
+}
+
+func TestSanitizeAgentCommitMessage_SimpleLine(t *testing.T) {
+	got := sanitizeAgentCommitMessage("Add branch-aware commit flow")
+	want := "Add branch-aware commit flow"
+	if got != want {
+		t.Fatalf("sanitizeAgentCommitMessage() = %q, want %q", got, want)
+	}
+}
+
+func TestSanitizeAgentCommitMessage_DropsSessionMarker(t *testing.T) {
+	got := sanitizeAgentCommitMessage("New session started.\nAdd commit message generation")
+	want := "Add commit message generation"
+	if got != want {
+		t.Fatalf("sanitizeAgentCommitMessage() = %q, want %q", got, want)
+	}
+}
+
+func TestSanitizeAgentCommitMessage_StripsPrefixAndQuotes(t *testing.T) {
+	got := sanitizeAgentCommitMessage("Commit message: \"Add commit message generation\"")
+	want := "Add commit message generation"
+	if got != want {
+		t.Fatalf("sanitizeAgentCommitMessage() = %q, want %q", got, want)
+	}
+}
+
+func TestSanitizeAgentCommitMessage_Empty(t *testing.T) {
+	got := sanitizeAgentCommitMessage(" \n\t")
+	if got != "" {
+		t.Fatalf("sanitizeAgentCommitMessage() = %q, want empty", got)
+	}
+}
+
+func TestSanitizeAgentPRBody_PreservesBullets(t *testing.T) {
+	got := sanitizeAgentPRBody("- Add commit message generation\n- Improve PR flow")
+	want := "- Add commit message generation\n- Improve PR flow"
+	if got != want {
+		t.Fatalf("sanitizeAgentPRBody() = %q, want %q", got, want)
+	}
+}
+
+func TestSanitizeAgentPRBody_DropsSessionMarkerAndPrefix(t *testing.T) {
+	got := sanitizeAgentPRBody("New session started.\nPR description: - Add commit flow updates")
+	want := "- Add commit flow updates"
+	if got != want {
+		t.Fatalf("sanitizeAgentPRBody() = %q, want %q", got, want)
+	}
+}
+
+func TestSanitizeAgentPRBody_StripsCodeFences(t *testing.T) {
+	got := sanitizeAgentPRBody("```markdown\n- Add commit flow updates\n- Document fallback\n```")
+	want := "- Add commit flow updates\n- Document fallback"
+	if got != want {
+		t.Fatalf("sanitizeAgentPRBody() = %q, want %q", got, want)
+	}
+}
+
+func TestSanitizeAgentPRBody_Empty(t *testing.T) {
+	got := sanitizeAgentPRBody(" \n\t")
+	if got != "" {
+		t.Fatalf("sanitizeAgentPRBody() = %q, want empty", got)
 	}
 }

@@ -459,7 +459,7 @@ func (svc *GitService) CreateWorkingBranch(repo *GitRepo, name string) (string, 
 	return branch, nil
 }
 
-func (svc *GitService) CommitPushAndOpenPR(repo *GitRepo, message string) (*CommitPRResult, error) {
+func (svc *GitService) CommitPushAndOpenPR(repo *GitRepo, message, prBody string) (*CommitPRResult, error) {
 	if repo == nil {
 		return nil, errors.New("repo is nil")
 	}
@@ -509,7 +509,7 @@ func (svc *GitService) CommitPushAndOpenPR(repo *GitRepo, message string) (*Comm
 		return nil, err
 	}
 
-	prURL, err := svc.createPullRequest(repo.Path, branch, baseBranch, commitMessage)
+	prURL, err := svc.createPullRequest(repo.Path, branch, baseBranch, commitMessage, prBody)
 	if err != nil {
 		return nil, err
 	}
@@ -701,7 +701,7 @@ func (svc *GitService) stagedFiles(repoPath string) ([]string, error) {
 	return files, nil
 }
 
-func (svc *GitService) createPullRequest(repoPath, headBranch, baseBranch, title string) (string, error) {
+func (svc *GitService) createPullRequest(repoPath, headBranch, baseBranch, title, body string) (string, error) {
 	if _, err := exec.LookPath("gh"); err != nil {
 		return "", errors.New("GitHub CLI (gh) is required to open a PR")
 	}
@@ -710,7 +710,10 @@ func (svc *GitService) createPullRequest(repoPath, headBranch, baseBranch, title
 	if prTitle == "" {
 		prTitle = "Update changes"
 	}
-	prBody := "Automated PR created by GoCode."
+	prBody := strings.TrimSpace(body)
+	if prBody == "" {
+		prBody = "Automated PR created by GoCode."
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
@@ -723,36 +726,52 @@ func (svc *GitService) createPullRequest(repoPath, headBranch, baseBranch, title
 	)
 	cmd.Dir = repoPath
 	output, err := cmd.CombinedOutput()
+	out := strings.TrimSpace(string(output))
+	if url := extractGitHubURL(out); url != "" {
+		return url, nil
+	}
 	if err == nil {
-		url := strings.TrimSpace(string(output))
-		if url != "" {
-			return url, nil
-		}
+		return "", errors.New("failed to create PR: empty response")
 	}
 
-	existingURL, viewErr := svc.existingPullRequestURL(repoPath, headBranch)
+	existingURL, viewErr := svc.existingPullRequestURL(repoPath, headBranch, baseBranch)
 	if viewErr == nil && existingURL != "" {
 		return existingURL, nil
 	}
 
-	out := strings.TrimSpace(string(output))
 	if out == "" && err != nil {
 		return "", fmt.Errorf("failed to create PR: %w", err)
 	}
 	return "", fmt.Errorf("failed to create PR: %s", out)
 }
 
-func (svc *GitService) existingPullRequestURL(repoPath, headBranch string) (string, error) {
+func (svc *GitService) existingPullRequestURL(repoPath, headBranch, baseBranch string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "gh", "pr", "view", "--head", headBranch, "--json", "url", "--jq", ".url")
+	cmd := exec.CommandContext(ctx, "gh", "pr", "list",
+		"--head", headBranch,
+		"--base", baseBranch,
+		"--state", "open",
+		"--json", "url",
+		"--jq", ".[0].url",
+	)
 	cmd.Dir = repoPath
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(output)), nil
+}
+
+var githubURLRe = regexp.MustCompile(`https://github\.com/\S+`)
+
+func extractGitHubURL(text string) string {
+	match := githubURLRe.FindString(strings.TrimSpace(text))
+	if match == "" {
+		return ""
+	}
+	return strings.TrimRight(match, ".,;:)]}\"'")
 }
 
 func (svc *GitService) branchExists(repoPath, branch string) bool {

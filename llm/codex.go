@@ -21,7 +21,7 @@ type CodexClient struct {
 
 const CodexID = "codex"
 
-const attachmentPromptPreamble = "Telegram integration note: if you want to return a local file as an attachment, include a standalone file URI in your final response using the format file://path/to/file (repo-relative paths preferred). Only reference files that already exist."
+const attachmentPromptPreamble = "Telegram integration note: only include a standalone file URI in your final response using the format file://path/to/file (repo-relative paths preferred) if the user specifically asks for files. Only reference files that already exist."
 
 func NewCodexClient() *CodexClient {
 	bin := os.Getenv("CODEX_BIN")
