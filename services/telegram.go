@@ -96,7 +96,7 @@ func (p *safeWebhookPoller) Poll(b *tb.Bot, dest chan tb.Update, stop chan struc
 	}
 
 	server := &http.Server{
-		Addr:    p.webhook.Listen,
+		Addr: p.webhook.Listen,
 		Handler: &safeWebhookHandler{
 			secretToken: p.webhook.SecretToken,
 			dest:        dest,
@@ -166,7 +166,7 @@ func (svc *TelegramService) Configure(ctx *context.Context) (err error) {
 	}
 
 	svc.Bot, err = tb.NewBot(tb.Settings{
-		Token: os.Getenv("TELEGRAM_SECRET"),
+		Token:  os.Getenv("TELEGRAM_SECRET"),
 		Poller: &safeWebhookPoller{webhook: webhook},
 		Client: &http.Client{
 			Timeout: 60 * time.Second,
@@ -739,8 +739,16 @@ func (svc *TelegramService) runAgentWithPendingUpdates(chat *tb.Chat, opts *tb.S
 		}
 	}()
 
-	logger.Info().Msg("calling agent.Run")
-	resp, runErr := svc.agent.Run(repoPath, prompt)
+	logger.Info().Msg("calling agent.RunWithEvents")
+	resp, runErr := svc.agent.RunWithEvents(repoPath, prompt, func(event AgentEvent) {
+		evtText := formatAgentEventMessage(event)
+		if strings.TrimSpace(evtText) == "" {
+			return
+		}
+		if _, err := svc.sendWithRetry(chat, evtText, opts); err != nil {
+			logger.Warn().Err(err).Msg("failed to send intra-agent event message")
+		}
+	})
 	elapsed := time.Since(started)
 	close(stopUpdates)
 	select {
@@ -804,6 +812,22 @@ func (svc *TelegramService) runAgentWithPendingUpdates(chat *tb.Chat, opts *tb.S
 }
 
 const maxAgentFailureDetailsLen = 3000
+
+func formatAgentEventMessage(event AgentEvent) string {
+	body := strings.TrimSpace(event.Text)
+	if body == "" {
+		return ""
+	}
+
+	switch event.Type {
+	case AgentEventForward:
+		return fmt.Sprintf("[Agent handoff] %s -> @%s\n\n%s", event.From, event.To, body)
+	case AgentEventResponse:
+		return fmt.Sprintf("[Agent response] @%s -> %s\n\n%s", event.From, event.To, body)
+	default:
+		return ""
+	}
+}
 
 func formatAgentFailureResponse(runErr error, output string) string {
 	lines := []string{"Agent failed to run."}

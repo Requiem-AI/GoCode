@@ -3,8 +3,9 @@ package llm
 import "context"
 
 type Request struct {
-	RepoPath string
-	Message  string
+	RepoPath        string
+	Message         string
+	AvailableAgents []string
 }
 
 type Response struct {
