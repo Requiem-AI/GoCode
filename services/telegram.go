@@ -2259,10 +2259,13 @@ func (svc *TelegramService) onRestart(c tb.Context) error {
 		log.Warn().Msg("onRestart: nil message")
 		return nil
 	}
+	chat := c.Chat()
+	threadID := 0
 
 	opts := &tb.SendOptions{}
 	if msg.TopicMessage && msg.ThreadID != 0 {
-		opts.ThreadID = msg.ThreadID
+		threadID = msg.ThreadID
+		opts.ThreadID = threadID
 	}
 	if err := c.Send("Restarting gocode...", opts); err != nil {
 		return err
@@ -2272,10 +2275,25 @@ func (svc *TelegramService) onRestart(c tb.Context) error {
 		time.Sleep(500 * time.Millisecond)
 		if err := svc.restartProcess(); err != nil {
 			log.Error().Err(err).Msg("failed to restart process")
+			svc.notifyRestartFailure(chat, threadID, err)
 		}
 	}()
 
 	return nil
+}
+
+type restartFailure struct {
+	Command     string
+	Err         error
+	IsBuildStep bool
+}
+
+func (e *restartFailure) Error() string {
+	return fmt.Sprintf("restart command failed: %s: %v", e.Command, e.Err)
+}
+
+func (e *restartFailure) Unwrap() error {
+	return e.Err
 }
 
 func (svc *TelegramService) restartProcess() error {
@@ -2292,12 +2310,55 @@ func (svc *TelegramService) restartProcess() error {
 	}
 	for _, args := range restartCommands {
 		if err := svc.runRestartCommand(projectDir, args...); err != nil {
-			return err
+			command := strings.Join(args, " ")
+			return &restartFailure{
+				Command:     command,
+				Err:         err,
+				IsBuildStep: command == "go build ./runtime/gocode.go",
+			}
 		}
 	}
 
 	log.Info().Msg("restart commands completed; terminating process for supervisor restart")
 	return syscall.Kill(os.Getpid(), syscall.SIGTERM)
+}
+
+func (svc *TelegramService) notifyRestartFailure(chat *tb.Chat, threadID int, err error) {
+	if chat == nil {
+		log.Warn().Err(err).Msg("restart failed but chat was nil; could not notify user")
+		return
+	}
+
+	restartErr, ok := err.(*restartFailure)
+	if !ok {
+		restartErr = &restartFailure{
+			Command: "unknown",
+			Err:     err,
+		}
+	}
+
+	opts := &tb.SendOptions{}
+	if threadID != 0 {
+		opts.ThreadID = threadID
+	}
+
+	parts := []string{
+		"Restart failed.",
+		fmt.Sprintf("Command: %s", restartErr.Command),
+		fmt.Sprintf("Error: %s", truncateTelegramText(restartErr.Error())),
+	}
+
+	if _, sendErr := svc.sendWithRetry(chat, strings.Join(parts, "\n"), opts); sendErr != nil {
+		log.Error().Err(sendErr).Msg("failed to notify restart failure")
+	}
+
+	if restartErr.IsBuildStep {
+		_, _ = svc.sendWithRetry(chat, "Build failed. Restarting current process to recover.", opts)
+		time.Sleep(500 * time.Millisecond)
+		if killErr := syscall.Kill(os.Getpid(), syscall.SIGTERM); killErr != nil {
+			log.Error().Err(killErr).Msg("failed to terminate process after restart failure")
+		}
+	}
 }
 
 func (svc *TelegramService) resolveProjectDir() (string, error) {
@@ -2332,9 +2393,9 @@ func (svc *TelegramService) runRestartCommand(projectDir string, args ...string)
 	if err != nil {
 		out := strings.TrimSpace(string(output))
 		if out == "" {
-			return fmt.Errorf("restart command failed: %s: %w", strings.Join(args, " "), err)
+			return err
 		}
-		return fmt.Errorf("restart command failed: %s: %w: %s", strings.Join(args, " "), err, out)
+		return fmt.Errorf("%w: %s", err, out)
 	}
 
 	return nil
