@@ -44,7 +44,7 @@ func TestParseAgentForward(t *testing.T) {
 		llm.ClaudeID: &fakeAgentClient{id: llm.ClaudeID},
 	}
 
-	target, payload, ok := parseAgentForward("Need a check. @claude review auth middleware.", available)
+	target, payload, ok := parseAgentForward("@claude review auth middleware.", available)
 	if !ok {
 		t.Fatalf("expected agent forward to be parsed")
 	}
@@ -53,6 +53,18 @@ func TestParseAgentForward(t *testing.T) {
 	}
 	if payload != "review auth middleware." {
 		t.Fatalf("payload = %q, want %q", payload, "review auth middleware.")
+	}
+}
+
+func TestParseAgentForward_IgnoresInlineTag(t *testing.T) {
+	available := map[string]llm.Client{
+		llm.CodexID:  &fakeAgentClient{id: llm.CodexID},
+		llm.ClaudeID: &fakeAgentClient{id: llm.ClaudeID},
+	}
+
+	_, _, ok := parseAgentForward("Thinking out loud @claude review auth middleware.", available)
+	if ok {
+		t.Fatalf("expected inline tag to be ignored")
 	}
 }
 
@@ -211,5 +223,25 @@ func TestStart_DefaultAgentHopTimeoutIsFiveMinutes(t *testing.T) {
 
 	if svc.agentHopTimeout != 5*time.Minute {
 		t.Fatalf("agentHopTimeout = %s, want 5m", svc.agentHopTimeout)
+	}
+}
+
+func TestClear_RemovesConversationCache(t *testing.T) {
+	svc := &AgentService{
+		clients: map[string]llm.Client{
+			llm.CodexID: &fakeAgentClient{id: llm.CodexID},
+		},
+		conversationCache: map[string][]conversationTurn{
+			"/tmp/repo": {
+				{Speaker: "user", Text: "hello"},
+			},
+		},
+	}
+
+	if err := svc.Clear("/tmp/repo"); err != nil {
+		t.Fatalf("Clear returned error: %v", err)
+	}
+	if _, ok := svc.conversationCache["/tmp/repo"]; ok {
+		t.Fatalf("expected conversation cache entry to be removed")
 	}
 }

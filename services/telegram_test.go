@@ -559,6 +559,32 @@ func TestFormatAgentFailureResponse_DeduplicatesErrorText(t *testing.T) {
 	}
 }
 
+func TestFormatAgentEventMessage_ForwardAsTagMessage(t *testing.T) {
+	got := formatAgentEventMessage(AgentEvent{
+		Type: AgentEventForward,
+		From: "codex",
+		To:   "claude",
+		Text: "review this plan",
+	})
+	want := "@claude review this plan"
+	if got != want {
+		t.Fatalf("formatAgentEventMessage() = %q, want %q", got, want)
+	}
+}
+
+func TestFormatAgentEventMessage_ResponseAsTagMessage(t *testing.T) {
+	got := formatAgentEventMessage(AgentEvent{
+		Type: AgentEventResponse,
+		From: "claude",
+		To:   "codex",
+		Text: "Looks good with minor fixes.",
+	})
+	want := "@codex Looks good with minor fixes."
+	if got != want {
+		t.Fatalf("formatAgentEventMessage() = %q, want %q", got, want)
+	}
+}
+
 func TestSanitizeAgentCommitMessage_SimpleLine(t *testing.T) {
 	got := sanitizeAgentCommitMessage("Add branch-aware commit flow")
 	want := "Add branch-aware commit flow"

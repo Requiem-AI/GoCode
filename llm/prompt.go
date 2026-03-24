@@ -23,8 +23,8 @@ func buildAgentPrompt(message string, availableAgents []string) string {
 	sections := []string{attachmentPromptPreamble}
 	if len(agents) > 0 {
 		sections = append(sections, fmt.Sprintf(
-			"Intra-agent collaboration is enabled. Ask another agent with `@<agent_id> <message>` only when needed. "+
-				"When your answer is complete, do not tag any agent. Available agents: %s.",
+			"Intra-agent collaboration is enabled. If you need another agent, your final response must be exactly one handoff line in this format: `@<agent_id> <message>`. "+
+				"Do not put `@agent` tags in analysis/scratchpad text. If the task is complete, reply normally with no `@agent` tag. Available agents: %s.",
 			strings.Join(agents, ", "),
 		))
 	}

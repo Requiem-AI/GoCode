@@ -23,8 +23,9 @@ import (
 type PreviewService struct {
 	context.DefaultService
 
-	mu       sync.Mutex
-	sessions map[string]*PreviewSession
+	mu           sync.Mutex
+	sessions     map[string]*PreviewSession
+	sessionLocks map[string]*sync.Mutex
 
 	devURLRe   *regexp.Regexp
 	portLineRe *regexp.Regexp
@@ -59,6 +60,7 @@ func (svc *PreviewService) Configure(ctx *context.Context) error {
 	}
 
 	svc.sessions = make(map[string]*PreviewSession)
+	svc.sessionLocks = make(map[string]*sync.Mutex)
 	svc.devURLRe = regexp.MustCompile(`http://(?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|\\[::1\\]):(\\d+)`)
 	svc.portLineRe = regexp.MustCompile(`(?i)\\b(?:port|listening)\\b[^0-9]*(\\d{2,5})`)
 	return nil
@@ -92,6 +94,10 @@ func (svc *PreviewService) StartPreview(chatID int64, threadID int, repoPath str
 		return nil, errors.New("repo path is empty")
 	}
 	key := topicKey(chatID, threadID)
+
+	lock := svc.sessionLock(key)
+	lock.Lock()
+	defer lock.Unlock()
 
 	svc.mu.Lock()
 	if session := svc.sessions[key]; session != nil {

@@ -821,9 +821,9 @@ func formatAgentEventMessage(event AgentEvent) string {
 
 	switch event.Type {
 	case AgentEventForward:
-		return fmt.Sprintf("[Agent handoff] %s -> @%s\n\n%s", event.From, event.To, body)
+		return fmt.Sprintf("@%s %s", event.To, body)
 	case AgentEventResponse:
-		return fmt.Sprintf("[Agent response] @%s -> %s\n\n%s", event.From, event.To, body)
+		return fmt.Sprintf("@%s %s", event.To, body)
 	default:
 		return ""
 	}

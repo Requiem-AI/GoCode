@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/requiem-ai/gocode/context"
@@ -23,6 +24,14 @@ type AgentService struct {
 	defaultAgent    string
 	maxHops         int
 	agentHopTimeout time.Duration
+
+	conversationMu    sync.Mutex
+	conversationCache map[string][]conversationTurn
+}
+
+type conversationTurn struct {
+	Speaker string
+	Text    string
 }
 
 type AgentEventType string
@@ -46,6 +55,8 @@ const (
 	defaultAgentID       = llm.CodexID
 	defaultMaxHops       = 8
 	defaultHopTimeout    = 5 * time.Minute
+	maxConversationTurns = 24
+	maxConversationChars = 500
 )
 
 var agentTagPattern = regexp.MustCompile(`@([a-zA-Z0-9_-]+)`)
@@ -108,6 +119,7 @@ func (svc *AgentService) Start() error {
 	svc.defaultAgent = defaultAgent
 	svc.maxHops = maxHops
 	svc.agentHopTimeout = agentHopTimeout
+	svc.conversationCache = make(map[string][]conversationTurn)
 	return nil
 }
 
@@ -123,13 +135,16 @@ func (svc *AgentService) RunWithEvents(repoPath string, msg string, onEvent func
 		return "", errors.New("agent service not initialized")
 	}
 
+	repoKey := conversationCacheKey(repoPath)
 	activeID := svc.defaultAgent
-	activeInput := msg
+	activeInput := svc.withConversationContext(repoKey, msg)
+	svc.appendConversationTurn(repoKey, "user", msg)
 	for hop := 0; hop < svc.maxHops; hop++ {
 		activeResp, err := svc.sendToAgent(repoPath, activeID, activeInput)
 		if err != nil {
 			return activeResp, err
 		}
+		svc.appendConversationTurn(repoKey, activeID, activeResp)
 
 		targetID, forwardMessage, ok := parseAgentForward(activeResp, svc.clients)
 		if !ok {
@@ -157,6 +172,7 @@ func (svc *AgentService) RunWithEvents(repoPath string, msg string, onEvent func
 		if err != nil {
 			return targetResp, err
 		}
+		svc.appendConversationTurn(repoKey, targetID, targetResp)
 
 		activeInput = fmt.Sprintf(
 			"Feedback received from @%s:\n\n%s\n\nContinue solving the user's task. "+
@@ -174,6 +190,9 @@ func (svc *AgentService) Clear(repoPath string) error {
 	if strings.TrimSpace(repoPath) == "" {
 		return errors.New("missing repo path")
 	}
+	svc.conversationMu.Lock()
+	delete(svc.conversationCache, conversationCacheKey(repoPath))
+	svc.conversationMu.Unlock()
 	for _, client := range svc.clients {
 		if err := client.Clear(ctx.TODO(), repoPath); err != nil {
 			return err
@@ -234,21 +253,91 @@ func parseEnabledAgents() []string {
 }
 
 func parseAgentForward(text string, available map[string]llm.Client) (targetID string, payload string, ok bool) {
-	matches := agentTagPattern.FindStringSubmatchIndex(text)
+	trimmed := strings.TrimSpace(text)
+	matches := agentTagPattern.FindStringSubmatchIndex(trimmed)
 	if len(matches) < 4 {
 		return "", "", false
 	}
+	if matches[0] != 0 {
+		return "", "", false
+	}
 
-	agentID := strings.ToLower(strings.TrimSpace(text[matches[2]:matches[3]]))
+	agentID := strings.ToLower(strings.TrimSpace(trimmed[matches[2]:matches[3]]))
 	if _, exists := available[agentID]; !exists {
 		return "", "", false
 	}
 
 	contentStart := matches[1]
-	message := strings.TrimSpace(text[contentStart:])
+	message := strings.TrimSpace(trimmed[contentStart:])
 	if message == "" {
 		return "", "", false
 	}
 
 	return agentID, message, true
+}
+
+func (svc *AgentService) appendConversationTurn(repoKey, speaker, text string) {
+	if strings.TrimSpace(repoKey) == "" {
+		return
+	}
+	trimmedSpeaker := strings.TrimSpace(strings.ToLower(speaker))
+	trimmedText := strings.TrimSpace(text)
+	if trimmedSpeaker == "" || trimmedText == "" {
+		return
+	}
+
+	svc.conversationMu.Lock()
+	defer svc.conversationMu.Unlock()
+	if svc.conversationCache == nil {
+		svc.conversationCache = make(map[string][]conversationTurn)
+	}
+
+	turns := append(svc.conversationCache[repoKey], conversationTurn{
+		Speaker: trimmedSpeaker,
+		Text:    trimmedText,
+	})
+	if len(turns) > maxConversationTurns {
+		turns = append([]conversationTurn(nil), turns[len(turns)-maxConversationTurns:]...)
+	}
+	svc.conversationCache[repoKey] = turns
+}
+
+func (svc *AgentService) withConversationContext(repoKey, message string) string {
+	trimmed := strings.TrimSpace(message)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.TrimSpace(repoKey) == "" {
+		return trimmed
+	}
+
+	svc.conversationMu.Lock()
+	turns := append([]conversationTurn(nil), svc.conversationCache[repoKey]...)
+	svc.conversationMu.Unlock()
+
+	if len(turns) == 0 {
+		return trimmed
+	}
+
+	lines := make([]string, 0, len(turns))
+	for _, turn := range turns {
+		text := strings.ReplaceAll(turn.Text, "\n", " ")
+		if len(text) > maxConversationChars {
+			text = text[:maxConversationChars] + "...[truncated]"
+		}
+		lines = append(lines, fmt.Sprintf("- %s: %s", turn.Speaker, text))
+	}
+	return fmt.Sprintf(
+		"Conversation history:\n%s\n\nNew user message:\n%s",
+		strings.Join(lines, "\n"),
+		trimmed,
+	)
+}
+
+func conversationCacheKey(repoPath string) string {
+	trimmed := strings.TrimSpace(repoPath)
+	if trimmed == "" {
+		return ""
+	}
+	return trimmed
 }

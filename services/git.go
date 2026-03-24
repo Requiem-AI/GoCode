@@ -33,8 +33,9 @@ type GitService struct {
 
 	BaseDir string
 
-	mu    sync.Mutex
-	repos map[string]*GitRepo
+	mu        sync.Mutex
+	repos     map[string]*GitRepo
+	repoLocks map[string]*sync.Mutex
 }
 
 type CommitPRResult struct {
@@ -68,6 +69,7 @@ func (svc *GitService) Configure(ctx *appctx.Context) error {
 
 	svc.BaseDir = absBase
 	svc.repos = make(map[string]*GitRepo)
+	svc.repoLocks = make(map[string]*sync.Mutex)
 
 	return nil
 }
@@ -173,6 +175,11 @@ func (svc *GitService) EnsureTopicRepoFromPath(chatID int64, threadID int, repoP
 		return nil, errors.New("missing topic thread id")
 	}
 
+	key := topicKey(chatID, threadID)
+	lock := svc.repoLock(key)
+	lock.Lock()
+	defer lock.Unlock()
+
 	trimmed := strings.TrimSpace(repoPath)
 	if trimmed == "" {
 		return nil, errors.New("repo path is empty")
@@ -200,7 +207,6 @@ func (svc *GitService) EnsureTopicRepoFromPath(chatID int64, threadID int, repoP
 		return nil, errors.New("repo path is not a git repository")
 	}
 
-	key := topicKey(chatID, threadID)
 	svc.mu.Lock()
 	repo := svc.repos[key]
 	svc.mu.Unlock()
@@ -368,6 +374,9 @@ func (svc *GitService) ensureTopicRepo(chatID int64, threadID int, repoURL, toke
 	}
 
 	key := topicKey(chatID, threadID)
+	lock := svc.repoLock(key)
+	lock.Lock()
+	defer lock.Unlock()
 
 	svc.mu.Lock()
 	repo := svc.repos[key]
@@ -526,11 +535,30 @@ func (svc *GitService) PullMain(repo *GitRepo) error {
 		return errors.New("repo is nil")
 	}
 
-	if err := svc.checkoutBranch(repo.Path, "main"); err != nil {
+	baseBranch := strings.TrimSpace(repo.DefaultBranch)
+	if baseBranch == "" {
+		baseBranch = "main"
+	}
+
+	if err := svc.checkoutBranch(repo.Path, baseBranch); err != nil {
 		return err
 	}
 
 	return svc.runGit(repo.Path, "pull")
+}
+
+func (svc *GitService) repoLock(key string) *sync.Mutex {
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+
+	lock, ok := svc.repoLocks[key]
+	if ok {
+		return lock
+	}
+
+	lock = &sync.Mutex{}
+	svc.repoLocks[key] = lock
+	return lock
 }
 
 func (svc *GitService) RunTopicGitCommand(repo *GitRepo, args ...string) (string, error) {
