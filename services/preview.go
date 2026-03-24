@@ -207,6 +207,18 @@ func (svc *PreviewService) monitorSession(session *PreviewSession) {
 	_ = svc.StopPreview(session.ChatID, session.ThreadID)
 }
 
+func (svc *PreviewService) sessionLock(key string) *sync.Mutex {
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+
+	lock := svc.sessionLocks[key]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		svc.sessionLocks[key] = lock
+	}
+	return lock
+}
+
 func (svc *PreviewService) startDevServer(repoPath string) (int, *exec.Cmd, ctx.CancelFunc, <-chan error, error) {
 	if _, err := os.Stat(filepath.Join(repoPath, "package.json")); err != nil {
 		return 0, nil, nil, nil, errors.New("package.json not found; unable to run yarn dev")
